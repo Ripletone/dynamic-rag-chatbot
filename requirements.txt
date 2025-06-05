@@ -1,6 +1,6 @@
 streamlit
 langchain==0.1.16
-langchain-core==0.1.43
+langchain-core==0.1.45
 langchain-google-genai==1.0.4
 langchain-huggingface==0.0.3
 langchain-community==0.0.32
