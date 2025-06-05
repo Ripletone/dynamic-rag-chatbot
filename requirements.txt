@@ -1,7 +1,7 @@
 streamlit
 langchain==0.1.16
 langchain-core==0.1.43
-langchain-google-genai==0.0.12
+langchain-google-genai==1.0.4
 langchain-huggingface==0.0.3
 langchain-community==0.0.32
 chromadb==0.4.24 # Keep this version for chromadb
