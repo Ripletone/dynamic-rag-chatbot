@@ -118,16 +118,18 @@ def get_url_collection_name(url: str) -> str:
 
 @st.cache_resource
 def get_embedding_function():
-    """Wrapper to load and cache the embedding model with UI feedback."""
-    with st.spinner("Loading embedding model..."):
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': 'cpu'})
-    st.toast("Embedding model loaded!", icon="✅")
+    """Loads and caches the embedding model."""
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': 'cpu'})
     return embeddings
 
 
 # This function is NOT cached with st.cache_resource anymore.
 # It directly interacts with st.session_state.faiss_indexes.
-def _load_or_create_faiss_index(text_chunks, collection_name_for_cache): # Renamed for clarity
+def _load_or_create_faiss_index(text_chunks, collection_name_for_cache):
+    # ...
+    with st.spinner("Loading embedding model..."): # <-- ADD THIS
+        embedding_function = get_embedding_function()
+    st.toast("Embedding model loaded!", icon="✅") # <-- ADD THIS
     """
     Internal function to create or load a FAISS vector store.
     This function directly manages st.session_state.faiss_indexes.
