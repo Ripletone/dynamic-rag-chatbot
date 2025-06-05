@@ -1,3 +1,4 @@
+import chromadb.utils.embedding_functions as embedding_functions
 import streamlit as st
 import os
 import google.generativeai as genai
@@ -27,8 +28,7 @@ nest_asyncio.apply()
 # --- Configuration Constants ---
 GEMINI_MODEL_NAME = "gemini-1.5-flash-latest"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-CHROMA_DB_PATH = "./chroma_db"
-DEFAULT_COLLECTION_NAME = "default_rag_collection"
+# CHROMA_DB_PATH = "./chroma_db" # No longer needed for in-memory ChromaDEFAULT_COLLECTION_NAME = "default_rag_collection"
 
 # --- API Key Handling ---
 # Access API key securely via Streamlit secrets
@@ -149,49 +149,72 @@ def get_embedding_function():
 
 
 # New internal cached function for vector store
+import chromadb.utils.embedding_functions as embedding_functions # Add this import at the top of your rag.py
+
 @st.cache_resource(hash_funcs={Chroma: id})
 def _load_or_create_vector_store(_text_chunks, _embedding_function, collection_name_for_cache):
     """
     Internal function to create or load a Chroma vector store.
     This function contains the core logic and is what gets cached.
+    For Streamlit Cloud, we use an in-memory client to avoid sqlite3 issues.
     """
-    persist_directory = CHROMA_DB_PATH
-    os.makedirs(persist_directory, exist_ok=True)
+    # We will no longer persist to disk on Streamlit Cloud to avoid sqlite3 issues
+    # The data will be lost on app rerun/refresh, but that's acceptable for a demo.
+
+    # Initialize an ephemeral (in-memory) client directly
+    # You'll need to remove the persist_directory argument entirely.
+    client = chromadb.Client() # This creates an in-memory client
 
     if _text_chunks:
-        # Create/Update the vector store
         try:
+            # Check if collection exists and delete if it does to ensure fresh data
+            try:
+                client.delete_collection(name=collection_name_for_cache)
+            except:
+                pass # Collection might not exist, ignore error
+
+            # Create the collection with the in-memory client
+            collection = client.get_or_create_collection(
+                name=collection_name_for_cache,
+                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
+            )
+
+            # Add documents (LangChain's .from_documents handles this now)
+            # Need to explicitly use LangChain's Chroma wrapper to integrate properly
             vector_db = Chroma.from_documents(
                 documents=_text_chunks,
-                embedding=_embedding_function,
+                embedding=_embedding_function, # Use the LangChain embedding function
                 collection_name=collection_name_for_cache,
-                persist_directory=persist_directory
+                client=client # Pass the in-memory client here
             )
             return vector_db
         except Exception as e:
             st.error(f"Error creating/updating knowledge base: {e}")
             return None
     else:
-        # Attempt to load an existing vector store
+        # Attempt to load an existing vector store from in-memory (only if it was created in same session)
         try:
-            collection_path = os.path.join(persist_directory, collection_name_for_cache)
-            if not os.path.exists(collection_path):
-                return None
-
-            vector_db = Chroma(
-                collection_name=collection_name_for_cache, 
-                embedding_function=_embedding_function,
-                persist_directory=persist_directory
-            )
-            count = vector_db._collection.count()
-            if count > 0:
-                return vector_db
+            # For in-memory, if _text_chunks is empty, we can't 'load' from disk.
+            # We can only try to get an existing in-memory collection from *this session*.
+            # If the app restarts, in-memory data is gone.
+            collection_names = [c.name for c in client.list_collections()]
+            if collection_name_for_cache in collection_names:
+                # Get the existing in-memory collection
+                vector_db = Chroma(
+                    client=client,
+                    collection_name=collection_name_for_cache,
+                    embedding_function=_embedding_function # Use the LangChain embedding function
+                )
+                count = vector_db._collection.count()
+                if count > 0:
+                    return vector_db
+                else:
+                    return None
             else:
-                return None 
+                return None
         except Exception as e:
             st.warning(f"ChromaDB load failed for {collection_name_for_cache}: {e}") 
             return None
-
 
 # Wrapper for get_vector_store to handle UI feedback
 def get_vector_store(text_chunks, embedding_function, collection_name=DEFAULT_COLLECTION_NAME):
