@@ -7,7 +7,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.messages import HumanMessage, AIMessage
 from operator import itemgetter
-# shutil is no longer used, can be removed. I'll keep it here for continuity.
 import shutil 
 import re
 from urllib.parse import urlparse
@@ -48,7 +47,6 @@ genai.configure(api_key=GOOGLE_API_KEY)
 
 # --- Streamlit Session State Initialization ---
 def initialize_session_state():
-    # vector_db will be managed directly within get_vector_store
     if "vector_db" not in st.session_state:
         st.session_state.vector_db = None
     if "current_content_source" not in st.session_state:
@@ -73,7 +71,6 @@ def initialize_session_state():
     if "lambda_mult_mmr" not in st.session_state:
         st.session_state.lambda_mult_mmr = 0.5
     
-    # Store FAISS indexes in session state as a dictionary
     if "faiss_indexes" not in st.session_state:
         st.session_state.faiss_indexes = {}
 
@@ -118,32 +115,25 @@ def get_url_collection_name(url: str) -> str:
 
 @st.cache_resource
 def get_embedding_function():
-    """Loads and caches the embedding model."""
+    """Loads and caches the embedding model (PURE function, NO UI interactions)."""
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': 'cpu'})
     return embeddings
 
 
-# This function is NOT cached with st.cache_resource anymore.
-# It directly interacts with st.session_state.faiss_indexes.
 def _load_or_create_faiss_index(text_chunks, collection_name_for_cache):
-    # ...
-    with st.spinner("Loading embedding model..."): # <-- ADD THIS
-        embedding_function = get_embedding_function()
-    st.toast("Embedding model loaded!", icon="✅") # <-- ADD THIS
     """
     Internal function to create or load a FAISS vector store.
     This function directly manages st.session_state.faiss_indexes.
     """
-    embedding_function = get_embedding_function() # Get embedding function inside
+    # embedding_function is called here. Its UI feedback (spinner/toast) is handled in manage_vector_store.
+    embedding_function = get_embedding_function() 
 
     if text_chunks:
         try:
-            # Create a new FAISS vector store from documents
             faiss_index = FAISS.from_documents(
                 documents=text_chunks,
                 embedding=embedding_function
             )
-            # Store the FAISS index by the collection name in session state
             st.session_state.faiss_indexes[collection_name_for_cache] = faiss_index
             st.toast(f"Knowledge base collection '{collection_name_for_cache}' created/updated successfully with {len(text_chunks)} chunks!", icon="✨")
             st.session_state.current_content_source = (
@@ -154,7 +144,6 @@ def _load_or_create_faiss_index(text_chunks, collection_name_for_cache):
             st.error(f"Error creating/updating knowledge base with FAISS: {e}")
             return None
     else:
-        # Attempt to retrieve an existing FAISS index from session state
         faiss_index = st.session_state.faiss_indexes.get(collection_name_for_cache)
         
         if faiss_index:
@@ -173,20 +162,27 @@ def manage_vector_store(text_chunks=None, collection_name=DEFAULT_COLLECTION_NAM
     cleaned_collection_name = clean_collection_name(collection_name)
     st.session_state.current_collection_name = cleaned_collection_name
 
+    # This is where the UI feedback for embedding model loading should happen.
+    with st.spinner("Loading embedding model (if not already cached)..."):
+        # Calling get_embedding_function here will trigger the cache if needed.
+        # We don't need to assign its output, just ensure it's loaded.
+        _ = get_embedding_function() 
+    st.toast("Embedding model ready!", icon="✅")
+
+
     if text_chunks is not None and len(text_chunks) > 0:
         st.info(f"Processing content for in-memory knowledge base '{cleaned_collection_name}'...")
         vector_db = _load_or_create_faiss_index(text_chunks, cleaned_collection_name)
-        st.session_state.vector_db = vector_db # Update the active vector_db
+        st.session_state.vector_db = vector_db
         if vector_db:
              st.session_state.current_content_source = (
                 f"Loaded from '{collection_name}'"
-            ) # Set content source more accurately
+            )
         else:
             st.session_state.current_content_source = None
     else:
-        # For initial load or when no new content is provided, try to load from session state
         vector_db = _load_or_create_faiss_index([], cleaned_collection_name)
-        st.session_state.vector_db = vector_db # Update the active vector_db
+        st.session_state.vector_db = vector_db
         if vector_db:
             st.session_state.current_content_source = (
                 f"Pre-existing knowledge base (in-memory: {cleaned_collection_name})"
@@ -572,7 +568,8 @@ with button_col:
 
 
 # --- Initial Load/Check for Existing DB ---
-# Call the management function for initial load (no text_chunks provided)
+# This block always calls manage_vector_store on app startup/rerun
+# The UI feedback (spinner/toast) for embedding model loading is now handled inside manage_vector_store
 manage_vector_store(collection_name=st.session_state.current_collection_name)
 
 
@@ -589,7 +586,6 @@ if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_f
         st.toast(f"Knowledge base ready for '{uploaded_file.name}'! You can now ask questions.", icon="🎉")
         st.rerun()
     else:
-        # If no text chunks, reset vector_db and source
         st.session_state.vector_db = None
         st.session_state.current_content_source = None
         st.session_state.uploaded_file_key += 1
@@ -609,7 +605,6 @@ if load_url_button and url_input and url_input != st.session_state.get("last_loa
         st.session_state.url_input_key += 1
         st.rerun()
     else:
-        # If no text chunks, reset vector_db and source
         st.session_state.vector_db = None
         st.session_state.current_content_source = None
         st.session_state.url_input_key += 1
