@@ -7,7 +7,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.messages import HumanMessage, AIMessage
 from operator import itemgetter
-import shutil 
 import re
 from urllib.parse import urlparse
 
@@ -122,7 +121,6 @@ def get_embedding_function():
     return embeddings
 
 
-@st.cache_resource(hash_funcs={FAISS: id}) # We hash FAISS instances by their ID, not content
 def _load_or_create_vector_store(_text_chunks, collection_name_for_cache): # Removed _embedding_function parameter
     """
     Internal function to create or load a FAISS vector store.
