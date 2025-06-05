@@ -1,0 +1,48 @@
+# .streamlit/config.toml
+
+[theme]
+base="light" 
+primaryColor="#4CAF50" 
+backgroundColor="#FFFFFF" 
+secondaryBackgroundColor="#F0F2F6" 
+textColor="#000000" # This is already set to black
+font="sans serif"
+# Optional: More granular font control
+# fontFace = "Arial Black, sans-serif" # Uncomment and change if you want a specific bold font face
+# fontSize = "14px"
+# Optional: Border radius for widgets
+# borderRadius = "0.25rem"
+
+[client]
+# Show less verbose error details to the user
+showErrorDetails = "none" 
+# Hide the top-right hamburger menu
+toolbarMode = "viewer" 
+# For multi-page apps, hide default sidebar navigation if you use custom navigation
+# showSidebarNavigation = false 
+
+[global]
+# Suppress the warning when setting widget values with both default and session_state
+disableWidgetStateDuplicationWarning = true
+# Suppress the warning when running with 'python my_app.py'
+showWarningOnDirectExecution = false
+
+[logger]
+# Set logging level for Streamlit's internal logger
+level = "info" 
+# Customize log message format
+# messageFormat = "%(asctime)s.%(msecs)03d %(levelname)s - %(message)s"
+
+[server]
+# Run the app on a different port (e.g., 8502)
+# port = 8502 
+# Don't open the browser automatically when running the app
+# headless = true 
+# Use watchdog for file watching (more efficient)
+# fileWatcherType = "watchdog" 
+# Automatically rerun the app on file save
+runOnSave = true
+
+[browser]
+# Prevent sending anonymous usage statistics to Streamlit
+gatherUsageStats = false
