@@ -12,3 +12,4 @@ pypdf==4.2.0
 docx2txt==0.8
 unstructured==0.12.6
 python-magic==0.4.27
+pysqlite3-binary
