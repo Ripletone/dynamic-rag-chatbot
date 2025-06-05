@@ -18,7 +18,9 @@ cffi==1.17.1
 chardet==5.2.0
 charset-normalizer==2.1.1
 chroma-hnswlib==0.7.6
-chromadb==0.5.23
+chromadb==0.4.24
+hnswlib==0.8.0
+packaging==23.2
 click==8.2.1
 coloredlogs==15.0.1
 cryptography==45.0.3
