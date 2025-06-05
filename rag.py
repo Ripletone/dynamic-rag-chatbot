@@ -7,7 +7,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.messages import HumanMessage, AIMessage
 from operator import itemgetter
-import shutil # Still imported but its rmtree won't be used for FAISS
+import shutil 
 import re
 from urllib.parse import urlparse
 
@@ -32,12 +32,10 @@ from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader, Tex
 # --- Configuration Constants ---
 GEMINI_MODEL_NAME = "gemini-1.5-flash-latest"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-# CHROMA_DB_PATH = "./chroma_db" # No longer needed as we use FAISS in-memory
-DEFAULT_COLLECTION_NAME = "default_faiss_collection" # Changed default name for clarity
+DEFAULT_COLLECTION_NAME = "default_faiss_collection"
 
 
 # --- API Key Handling ---
-# Access API key securely via Streamlit secrets
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except KeyError:
@@ -62,7 +60,6 @@ def initialize_session_state():
     if "uploaded_file_key" not in st.session_state:
         st.session_state.uploaded_file_key = 0
     
-    # Initialize configuration parameters in session state
     if "llm_temperature" not in st.session_state:
         st.session_state.llm_temperature = 0.0
     if "top_k_retrieval" not in st.session_state:
@@ -74,7 +71,6 @@ def initialize_session_state():
     if "lambda_mult_mmr" not in st.session_state:
         st.session_state.lambda_mult_mmr = 0.5
     
-    # New: Store FAISS indexes in session state since they are in-memory
     if "faiss_indexes" not in st.session_state:
         st.session_state.faiss_indexes = {}
 
@@ -92,16 +88,12 @@ def clean_collection_name(name: str) -> str:
     if not isinstance(name, str) or not name.strip():
         return DEFAULT_COLLECTION_NAME
 
-    # Replace invalid characters with an underscore
     cleaned_name = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
-    # Remove leading/trailing non-alphanumeric characters
     cleaned_name = re.sub(r'^[^a-zA-Z0-9]+', '', cleaned_name)
     cleaned_name = re.sub(r'[^a-zA-Z0-9]+$', '', cleaned_name)
-    # Ensure minimum length (arbitrary for FAISS, but good practice)
     if len(cleaned_name) < 3:
         cleaned_name = "collection_" + cleaned_name.lower()
-    # Truncate to a reasonable length if too long, as it's a key in a dict
-    cleaned_name = cleaned_name[:100] # FAISS doesn't have strict limits like Chroma's 63, but keep it manageable.
+    cleaned_name = cleaned_name[:100]
 
     if not cleaned_name.strip() or not cleaned_name[0].isalnum() or not cleaned_name[-1].isalnum():
         return DEFAULT_COLLECTION_NAME
@@ -114,7 +106,7 @@ def get_url_collection_name(url: str) -> str:
     base_name = f"{parsed_url.netloc}{parsed_url.path}".strip('/')
     if not base_name:
         base_name = "web_content"
-    unique_suffix = str(abs(hash(url))) # Hash the full URL for uniqueness
+    unique_suffix = str(abs(hash(url)))
     combined_name = f"{base_name}_{unique_suffix}"
     return clean_collection_name(combined_name)
 
@@ -122,20 +114,16 @@ def get_url_collection_name(url: str) -> str:
 # --- Caching and Document Handling Functions ---
 
 @st.cache_resource
-def _load_embedding_model():
-    """Internal function to load the embedding model, to be cached."""
-    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': 'cpu'})
-
 def get_embedding_function():
     """Wrapper to load and cache the embedding model with UI feedback."""
     with st.spinner("Loading embedding model..."):
-        embeddings = _load_embedding_model()
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={'device': 'cpu'})
     st.toast("Embedding model loaded!", icon="✅")
     return embeddings
 
 
-@st.cache_resource(hash_funcs={FAISS: id}) # Changed from Chroma to FAISS
-def _load_or_create_vector_store(_text_chunks, _embedding_function, collection_name_for_cache):
+@st.cache_resource(hash_funcs={FAISS: id}) # We hash FAISS instances by their ID, not content
+def _load_or_create_vector_store(_text_chunks, collection_name_for_cache): # Removed _embedding_function parameter
     """
     Internal function to create or load a FAISS vector store.
     This function contains the core logic and is what gets cached.
@@ -143,17 +131,14 @@ def _load_or_create_vector_store(_text_chunks, _embedding_function, collection_n
     The data will be in-memory and reloaded on app rerun/refresh/new upload.
     """
     vector_db = None
+    embedding_function = get_embedding_function() # Get embedding function inside the cached function
 
     if _text_chunks:
         try:
-            # Create a new FAISS vector store from documents
-            # FAISS is in-memory and does not have 'persist_directory' or a 'client' argument directly
             vector_db = FAISS.from_documents(
                 documents=_text_chunks,
-                embedding=_embedding_function
+                embedding=embedding_function # Use the internally obtained embedding function
             )
-            # Store the FAISS index by the collection name in session state for retrieval later in the same session
-            # This simulates having different "collections" for different sources or re-using previous ones.
             st.session_state.faiss_indexes = st.session_state.get('faiss_indexes', {})
             st.session_state.faiss_indexes[collection_name_for_cache] = vector_db
             return vector_db
@@ -161,23 +146,19 @@ def _load_or_create_vector_store(_text_chunks, _embedding_function, collection_n
             st.error(f"Error creating/updating knowledge base with FAISS: {e}")
             return None
     else:
-        # Attempt to retrieve an existing FAISS index from session state (in-memory from current session)
         st.session_state.faiss_indexes = st.session_state.get('faiss_indexes', {})
         vector_db = st.session_state.faiss_indexes.get(collection_name_for_cache)
         
         if vector_db:
-            # For FAISS, checking count isn't as straightforward as Chroma,
-            # but if it's retrieved from a previously stored session_state index, it has content.
             st.toast(f"Knowledge base collection '{collection_name_for_cache}' loaded from session state!", icon="📚")
             return vector_db
         else:
-            # For FAISS, if no text chunks and no existing in-memory index, nothing to load.
             st.warning(f"No existing knowledge base collection '{collection_name_for_cache}' in memory. Please upload a document or load a URL.")
             return None
 
 
 # Wrapper for get_vector_store to handle UI feedback
-def get_vector_store(text_chunks, embedding_function, collection_name=DEFAULT_COLLECTION_NAME):
+def get_vector_store(text_chunks, collection_name=DEFAULT_COLLECTION_NAME): # Removed embedding_function parameter
     """
     Wrapper function that calls the cached vector store logic and handles Streamlit UI feedback.
     """
@@ -190,21 +171,16 @@ def get_vector_store(text_chunks, embedding_function, collection_name=DEFAULT_CO
         st.info(f"Creating/Updating in-memory knowledge base collection '{cleaned_collection_name}'. This might take a moment...")
         vector_db = _load_or_create_vector_store(
             text_chunks,
-            embedding_function,
             cleaned_collection_name
         )
         if vector_db:
             st.toast(f"Knowledge base collection '{cleaned_collection_name}' created/updated successfully with {len(text_chunks)} chunks!", icon="✨")
-        # Error message is handled inside _load_or_create_vector_store if it returns None
 
     else:
-        # This branch is for attempting to load an existing DB from session state on app startup
         vector_db = _load_or_create_vector_store(
-            [], # Pass empty chunks to trigger loading from session state
-            embedding_function,
+            [],
             cleaned_collection_name
         )
-        # st.warning/st.toast messages are handled within _load_or_create_vector_store in this branch
 
     return vector_db
 
@@ -248,14 +224,13 @@ def process_document_to_chunks(uploaded_file, chunk_size, chunk_overlap):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         text_chunks = text_splitter.split_documents(documents)
 
-        st.toast(f"Document '{uploaded_file.name}' processed into {len(text_chunks)} chunks!", icon="�")
+        st.toast(f"Document '{uploaded_file.name}' processed into {len(text_chunks)} chunks!", icon="📄")
         return text_chunks
 
     except Exception as e:
         st.error(f"Error processing document '{uploaded_file.name}': {e}")
         return []
     finally:
-        # Clean up temporary file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
@@ -290,7 +265,7 @@ def process_url_to_chunks(url_input, chunk_size, chunk_overlap):
 
 # Agent for flexible tool use
 def get_llm_agent(
-    vector_db, # This will now be a FAISS object or None
+    vector_db,
     llm_temperature_param: float,
     search_type_param: str,
     k_param: int,
@@ -306,20 +281,15 @@ def get_llm_agent(
         google_api_key=GOOGLE_API_KEY
     )
 
-    # --- 1. Define the Tools ---
     tools = []
 
-    # A. Knowledge Base Retriever Tool (if vector_db exists)
     if vector_db:
-        # Create retriever based on selected search type
-        # FAISS does not support MMR directly in this retriever interface
-        # For FAISS, we typically stick to "similarity" or similar search types
-        if search_type_param == "Similarity" or search_type_param == "MMR": # Treat MMR as Similarity for FAISS
+        if search_type_param == "Similarity" or search_type_param == "MMR":
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param})
             if search_type_param == "MMR":
                 st.warning("MMR search type is not directly supported by FAISS retriever. Using 'similarity' instead.")
         else:
-            retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param}) # Fallback
+            retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param})
 
         knowledge_base_tool = create_retriever_tool(
             retriever,
@@ -328,7 +298,6 @@ def get_llm_agent(
         )
         tools.append(knowledge_base_tool)
 
-    # B. Web Search Tool (DuckDuckGo)
     web_search = DuckDuckGoSearchResults(max_results=5)
     web_search_tool = Tool(
         name="Web_Search",
@@ -426,14 +395,14 @@ st.markdown(
     <style>
     /* Force body and general text color/font */
     body, p, div, span, h1, h2, h3, h4, h5, h6, .stMarkdown {
-        color: #000000 !important; /* Changed to BLACK */
-        font-family: sans-serif !important; /* You can change this to a specific font like "Roboto, sans-serif" */
-        font-weight: normal !important; /* Changed to NORMAL (unbolded) */
+        color: #000000 !important;
+        font-family: sans-serif !important;
+        font-weight: normal !important;
     }
 
     /* Keep the original styling for Streamlit-generated code blocks and preformatted text */
     code, pre {
-        font-family: monospace !important; /* Ensure code blocks remain monospace */
+        font-family: monospace !important;
     }
 
     /* Styling for the URL input text box */
@@ -442,10 +411,10 @@ st.markdown(
         border-radius: 8px;
         padding: 10px 15px;
         background-color: #f8fcf8;
-        color: #333 !important; /* Ensure input text color is still dark, not black */
+        color: #333 !important;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        font-family: sans-serif !important; /* Ensure input text font is sensible */
-        font-weight: normal !important; /* Ensure input text is not bold unless intended */
+        font-family: sans-serif !important;
+        font-weight: normal !important;
     }
 
     /* Styling for the chat input text box */
@@ -454,10 +423,10 @@ st.markdown(
         border-radius: 20px;
         padding: 12px 20px;
         background-color: #eaf6ff;
-        color: #333 !important; /* Ensure chat input text color is still dark, not black */
-        box_shadow: 0 2px 5px rgba(0,0,0,0.15);
-        font-family: sans-serif !important; /* Ensure chat input text font is sensible */
-        font-weight: normal !important; /* Ensure input text is not bold unless intended */
+        color: #333 !important;
+        box-shadow: 0 2px 5px rgba(0,0,0,0.15);
+        font-family: sans-serif !important;
+        font-weight: normal !important;
     }
 
     /* Styling for the Sources expander */
@@ -467,7 +436,7 @@ st.markdown(
         padding: 5px 15px;
         margin-top: 20px;
         background-color: #f1f8f9;
-        box_shadow: 0 1px 3px rgba(0,0,0,0.08);
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
 
     /* Optional: Style for the chat message boxes themselves */
@@ -476,7 +445,7 @@ st.markdown(
         border-radius: 12px;
         padding: 15px;
         margin-bottom: 10px;
-        box_shadow: 0 1px 3px rgba(0,0,0,0.05);
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
 
     .stChatMessage.st-chat-message-user {
@@ -593,16 +562,13 @@ with button_col:
 
 
 # --- Initial Load/Check for Existing DB ---
-# This block attempts to load an existing DB from session state when the app first starts or reruns
 if st.session_state.vector_db is None and st.session_state.current_content_source is None:
-    embedding_function = get_embedding_function()
+    # We no longer pass embedding_function here, it's retrieved inside _load_or_create_vector_store
     st.session_state.vector_db = _load_or_create_vector_store(
-        text_chunks=[], # Pass empty chunks to trigger loading from session state
-        embedding_function=embedding_function,
-        collection_name=st.session_state.current_collection_name # Use current collection name
+        text_chunks=[],
+        collection_name=st.session_state.current_collection_name
     )
     if st.session_state.vector_db:
-        # If successfully loaded from session state, update current_content_source
         st.session_state.current_content_source = f"Pre-existing knowledge base (in-memory: {st.session_state.current_collection_name})"
 
 
@@ -615,9 +581,8 @@ if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_f
         text_chunks = process_document_to_chunks(uploaded_file, st.session_state.chunk_size, st.session_state.chunk_overlap)
 
     if text_chunks:
-        embedding_function = get_embedding_function()
-        file_collection_name = clean_collection_name(os.path.splitext(uploaded_file.name)[0])
-        st.session_state.vector_db = get_vector_store(text_chunks, embedding_function, collection_name=file_collection_name)
+        # We no longer pass embedding_function here, it's retrieved inside get_vector_store
+        st.session_state.vector_db = get_vector_store(text_chunks, collection_name=clean_collection_name(os.path.splitext(uploaded_file.name)[0]))
 
         if st.session_state.vector_db:
             st.session_state.current_content_source = uploaded_file.name
@@ -638,9 +603,8 @@ if load_url_button and url_input and url_input != st.session_state.get("last_loa
     text_chunks = process_url_to_chunks(url_input, st.session_state.chunk_size, st.session_state.chunk_overlap)
 
     if text_chunks:
-        embedding_function = get_embedding_function()
-        url_collection_name = get_url_collection_name(url_input)
-        st.session_state.vector_db = get_vector_store(text_chunks, embedding_function, collection_name=url_collection_name)
+        # We no longer pass embedding_function here, it's retrieved inside get_vector_store
+        st.session_state.vector_db = get_vector_store(text_chunks, collection_name=get_url_collection_name(url_input))
 
         if st.session_state.vector_db:
             st.session_state.current_content_source = url_input
@@ -702,9 +666,9 @@ if st.sidebar.button("Clear Chat and Reset RAG Data"):
     st.session_state.last_uploaded_filename = ""
     st.session_state.last_loaded_url = ""
     
-    # Clear all FAISS indexes stored in session state
     if 'faiss_indexes' in st.session_state:
         st.session_state.faiss_indexes = {}
         st.toast("In-memory knowledge bases cleared!", icon="🗑️")
 
     st.rerun()
+
