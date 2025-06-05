@@ -1,15 +1,13 @@
-import chromadb.utils.embedding_functions as embedding_functions
 import streamlit as st
 import os
 import google.generativeai as genai
 from langchain.chains.combine_documents import create_stuff_documents_chain
-# Ensure MessagesPlaceholder is imported
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder 
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.messages import HumanMessage, AIMessage
 from operator import itemgetter
-import shutil
+import shutil # Still imported but its rmtree won't be used for FAISS
 import re
 from urllib.parse import urlparse
 
@@ -20,15 +18,23 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.tools.retriever import create_retriever_tool
 
 # CRITICAL FIX: Use nest_asyncio to handle event loop conflicts in Streamlit
-# This allows asynchronous operations to run smoothly within Streamlit's environment.
 import nest_asyncio
 nest_asyncio.apply()
+
+# LangChain Imports - NOW USING FAISS INSTEAD OF CHROMA
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS # Changed from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader, TextLoader, UnstructuredMarkdownLoader, Docx2txtLoader
 
 
 # --- Configuration Constants ---
 GEMINI_MODEL_NAME = "gemini-1.5-flash-latest"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-# CHROMA_DB_PATH = "./chroma_db" # No longer needed for in-memory ChromaDEFAULT_COLLECTION_NAME = "default_rag_collection"
+# CHROMA_DB_PATH = "./chroma_db" # No longer needed as we use FAISS in-memory
+DEFAULT_COLLECTION_NAME = "default_faiss_collection" # Changed default name for clarity
+
 
 # --- API Key Handling ---
 # Access API key securely via Streamlit secrets
@@ -39,6 +45,7 @@ except KeyError:
     st.stop()
 
 genai.configure(api_key=GOOGLE_API_KEY)
+
 
 # --- Streamlit Session State Initialization ---
 def initialize_session_state():
@@ -66,52 +73,36 @@ def initialize_session_state():
         st.session_state.fetch_k_mmr = 20
     if "lambda_mult_mmr" not in st.session_state:
         st.session_state.lambda_mult_mmr = 0.5
+    
+    # New: Store FAISS indexes in session state since they are in-memory
+    if "faiss_indexes" not in st.session_state:
+        st.session_state.faiss_indexes = {}
+
 
 initialize_session_state()
-
-# --- LangChain Imports (Conditional, as they might be imported based on need) ---
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
-# THIS IS THE CRITICAL LINE: CORRECTED IMPORT PATH FOR DOCUMENT LOADERS
-from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader, TextLoader, UnstructuredMarkdownLoader, Docx2txtLoader
 
 
 # --- Helper Functions for Naming and Data Processing ---
 
 def clean_collection_name(name: str) -> str:
     """
-    Cleans a string to be a valid ChromaDB collection name.
-    ChromaDB collection names must be 3-63 characters, use [a-zA-Z0-9._-],
-    and start/end with an alphanumeric character.
+    Cleans a string to be a valid collection identifier for FAISS.
+    FAISS doesn't have strict naming like ChromaDB, but a cleaned name is good for keys.
     """
     if not isinstance(name, str) or not name.strip():
         return DEFAULT_COLLECTION_NAME
 
-    # 1. Replace invalid characters with an underscore
+    # Replace invalid characters with an underscore
     cleaned_name = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
-
-    # 2. Remove leading/trailing non-alphanumeric characters (if any were introduced)
+    # Remove leading/trailing non-alphanumeric characters
     cleaned_name = re.sub(r'^[^a-zA-Z0-9]+', '', cleaned_name)
     cleaned_name = re.sub(r'[^a-zA-Z0-9]+$', '', cleaned_name)
-
-    # 3. Ensure minimum length
+    # Ensure minimum length (arbitrary for FAISS, but good practice)
     if len(cleaned_name) < 3:
         cleaned_name = "collection_" + cleaned_name.lower()
+    # Truncate to a reasonable length if too long, as it's a key in a dict
+    cleaned_name = cleaned_name[:100] # FAISS doesn't have strict limits like Chroma's 63, but keep it manageable.
 
-    # 4. Ensure it starts and ends with an alphanumeric character (more robust check)
-    if not cleaned_name:
-        return DEFAULT_COLLECTION_NAME
-    if not cleaned_name[0].isalnum():
-        cleaned_name = 'c' + cleaned_name
-    if not cleaned_name[-1].isalnum():
-        cleaned_name = cleaned_name + 'c'
-
-    # 5. Truncate if it's too long (ChromaDB limit is 63 characters)
-    cleaned_name = cleaned_name[:63] # Changed from 512 to 63
-
-    # Final fallback if cleaning results in an unrecoverable state or still invalid
     if not cleaned_name.strip() or not cleaned_name[0].isalnum() or not cleaned_name[-1].isalnum():
         return DEFAULT_COLLECTION_NAME
 
@@ -120,15 +111,10 @@ def clean_collection_name(name: str) -> str:
 def get_url_collection_name(url: str) -> str:
     """Generates a consistent collection name from a URL."""
     parsed_url = urlparse(url)
-    # Use the domain and path, then hash for uniqueness and clean
     base_name = f"{parsed_url.netloc}{parsed_url.path}".strip('/')
     if not base_name:
         base_name = "web_content"
-
-    # Hash the full URL to ensure uniqueness for different paths/queries on the same domain
-    unique_suffix = str(abs(hash(url)))
-
-    # Combine a cleaned version of the base name with the unique hash
+    unique_suffix = str(abs(hash(url))) # Hash the full URL for uniqueness
     combined_name = f"{base_name}_{unique_suffix}"
     return clean_collection_name(combined_name)
 
@@ -148,73 +134,47 @@ def get_embedding_function():
     return embeddings
 
 
-# New internal cached function for vector store
-import chromadb.utils.embedding_functions as embedding_functions # Add this import at the top of your rag.py
-
-@st.cache_resource(hash_funcs={Chroma: id})
+@st.cache_resource(hash_funcs={FAISS: id}) # Changed from Chroma to FAISS
 def _load_or_create_vector_store(_text_chunks, _embedding_function, collection_name_for_cache):
     """
-    Internal function to create or load a Chroma vector store.
+    Internal function to create or load a FAISS vector store.
     This function contains the core logic and is what gets cached.
-    For Streamlit Cloud, we use an in-memory client to avoid sqlite3 issues.
+    For Streamlit Cloud, we use an in-memory FAISS vector store.
+    The data will be in-memory and reloaded on app rerun/refresh/new upload.
     """
-    # We will no longer persist to disk on Streamlit Cloud to avoid sqlite3 issues
-    # The data will be lost on app rerun/refresh, but that's acceptable for a demo.
-
-    # Initialize an ephemeral (in-memory) client directly
-    # You'll need to remove the persist_directory argument entirely.
-    client = chromadb.Client() # This creates an in-memory client
+    vector_db = None
 
     if _text_chunks:
         try:
-            # Check if collection exists and delete if it does to ensure fresh data
-            try:
-                client.delete_collection(name=collection_name_for_cache)
-            except:
-                pass # Collection might not exist, ignore error
-
-            # Create the collection with the in-memory client
-            collection = client.get_or_create_collection(
-                name=collection_name_for_cache,
-                embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL_NAME)
-            )
-
-            # Add documents (LangChain's .from_documents handles this now)
-            # Need to explicitly use LangChain's Chroma wrapper to integrate properly
-            vector_db = Chroma.from_documents(
+            # Create a new FAISS vector store from documents
+            # FAISS is in-memory and does not have 'persist_directory' or a 'client' argument directly
+            vector_db = FAISS.from_documents(
                 documents=_text_chunks,
-                embedding=_embedding_function, # Use the LangChain embedding function
-                collection_name=collection_name_for_cache,
-                client=client # Pass the in-memory client here
+                embedding=_embedding_function
             )
+            # Store the FAISS index by the collection name in session state for retrieval later in the same session
+            # This simulates having different "collections" for different sources or re-using previous ones.
+            st.session_state.faiss_indexes = st.session_state.get('faiss_indexes', {})
+            st.session_state.faiss_indexes[collection_name_for_cache] = vector_db
             return vector_db
         except Exception as e:
-            st.error(f"Error creating/updating knowledge base: {e}")
+            st.error(f"Error creating/updating knowledge base with FAISS: {e}")
             return None
     else:
-        # Attempt to load an existing vector store from in-memory (only if it was created in same session)
-        try:
-            # For in-memory, if _text_chunks is empty, we can't 'load' from disk.
-            # We can only try to get an existing in-memory collection from *this session*.
-            # If the app restarts, in-memory data is gone.
-            collection_names = [c.name for c in client.list_collections()]
-            if collection_name_for_cache in collection_names:
-                # Get the existing in-memory collection
-                vector_db = Chroma(
-                    client=client,
-                    collection_name=collection_name_for_cache,
-                    embedding_function=_embedding_function # Use the LangChain embedding function
-                )
-                count = vector_db._collection.count()
-                if count > 0:
-                    return vector_db
-                else:
-                    return None
-            else:
-                return None
-        except Exception as e:
-            st.warning(f"ChromaDB load failed for {collection_name_for_cache}: {e}") 
+        # Attempt to retrieve an existing FAISS index from session state (in-memory from current session)
+        st.session_state.faiss_indexes = st.session_state.get('faiss_indexes', {})
+        vector_db = st.session_state.faiss_indexes.get(collection_name_for_cache)
+        
+        if vector_db:
+            # For FAISS, checking count isn't as straightforward as Chroma,
+            # but if it's retrieved from a previously stored session_state index, it has content.
+            st.toast(f"Knowledge base collection '{collection_name_for_cache}' loaded from session state!", icon="📚")
+            return vector_db
+        else:
+            # For FAISS, if no text chunks and no existing in-memory index, nothing to load.
+            st.warning(f"No existing knowledge base collection '{collection_name_for_cache}' in memory. Please upload a document or load a URL.")
             return None
+
 
 # Wrapper for get_vector_store to handle UI feedback
 def get_vector_store(text_chunks, embedding_function, collection_name=DEFAULT_COLLECTION_NAME):
@@ -227,7 +187,7 @@ def get_vector_store(text_chunks, embedding_function, collection_name=DEFAULT_CO
     vector_db = None
 
     if text_chunks:
-        st.warning(f"Creating/Updating knowledge base collection '{cleaned_collection_name}'. This might take a moment...")
+        st.info(f"Creating/Updating in-memory knowledge base collection '{cleaned_collection_name}'. This might take a moment...")
         vector_db = _load_or_create_vector_store(
             text_chunks,
             embedding_function,
@@ -238,17 +198,13 @@ def get_vector_store(text_chunks, embedding_function, collection_name=DEFAULT_CO
         # Error message is handled inside _load_or_create_vector_store if it returns None
 
     else:
-        # This branch is for attempting to load an existing DB on app startup
-        st.toast(f"Attempting to load existing knowledge base collection '{cleaned_collection_name}' from disk...", icon="⏳")
+        # This branch is for attempting to load an existing DB from session state on app startup
         vector_db = _load_or_create_vector_store(
-            [], 
+            [], # Pass empty chunks to trigger loading from session state
             embedding_function,
             cleaned_collection_name
         )
-        if vector_db:
-            st.toast(f"Knowledge base collection '{cleaned_collection_name}' loaded from disk with {vector_db._collection.count()} items!", icon="📚")
-        else:
-            st.warning(f"Could not load existing knowledge base collection '{cleaned_collection_name}'. It might not exist or is empty. Please upload a document or load a URL.")
+        # st.warning/st.toast messages are handled within _load_or_create_vector_store in this branch
 
     return vector_db
 
@@ -292,13 +248,14 @@ def process_document_to_chunks(uploaded_file, chunk_size, chunk_overlap):
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         text_chunks = text_splitter.split_documents(documents)
 
-        st.toast(f"Document '{uploaded_file.name}' processed into {len(text_chunks)} chunks!", icon="📄")
+        st.toast(f"Document '{uploaded_file.name}' processed into {len(text_chunks)} chunks!", icon="�")
         return text_chunks
 
     except Exception as e:
         st.error(f"Error processing document '{uploaded_file.name}': {e}")
         return []
     finally:
+        # Clean up temporary file
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
@@ -331,9 +288,9 @@ def process_url_to_chunks(url_input, chunk_size, chunk_overlap):
             st.error(f"Error loading URL: {e}")
             return []
 
-# MODIFIED: Now an agent for flexible tool use
+# Agent for flexible tool use
 def get_llm_agent(
-    vector_db,
+    vector_db, # This will now be a FAISS object or None
     llm_temperature_param: float,
     search_type_param: str,
     k_param: int,
@@ -355,27 +312,26 @@ def get_llm_agent(
     # A. Knowledge Base Retriever Tool (if vector_db exists)
     if vector_db:
         # Create retriever based on selected search type
-        if search_type_param == "Similarity":
+        # FAISS does not support MMR directly in this retriever interface
+        # For FAISS, we typically stick to "similarity" or similar search types
+        if search_type_param == "Similarity" or search_type_param == "MMR": # Treat MMR as Similarity for FAISS
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param})
-        elif search_type_param == "MMR":
-            retriever = vector_db.as_retriever(
-                search_type="mmr",
-                search_kwargs={"k": k_param, "fetch_k": fetch_k_param, "lambda_mult": lambda_mult_param}
-            )
+            if search_type_param == "MMR":
+                st.warning("MMR search type is not directly supported by FAISS retriever. Using 'similarity' instead.")
         else:
             retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param}) # Fallback
 
         knowledge_base_tool = create_retriever_tool(
             retriever,
-            name="KnowledgeBase_Search", # Tool name for the agent to use
+            name="KnowledgeBase_Search",
             description="Searches and returns information from the user-provided documents in the knowledge base. Use this for questions specifically about uploaded content.",
         )
         tools.append(knowledge_base_tool)
 
     # B. Web Search Tool (DuckDuckGo)
-    web_search = DuckDuckGoSearchResults(max_results=5) # Limit results to avoid overwhelming LLM
+    web_search = DuckDuckGoSearchResults(max_results=5)
     web_search_tool = Tool(
-        name="Web_Search", # Tool name for the agent to use
+        name="Web_Search",
         description="Useful for when you need to answer questions about current events, facts, or anything not covered in the provided documents. Prioritize the KnowledgeBase_Search tool if the question is likely about uploaded content.",
         func=web_search.run,
     )
@@ -385,14 +341,7 @@ def get_llm_agent(
         st.warning("No tools are available for the agent. Please load a document or ensure tools are correctly defined.")
         return None
     
-    # Removed st.sidebar.subheader("Agent Tools (for Debugging)") and loop to clean up layout
-
-
-    # --- 2. Define the Agent's Prompt ---
-    # The agent's prompt guides its reasoning and tool selection.
-    # It needs to know about chat history, tools, and agent_scratchpad.
     agent_prompt = ChatPromptTemplate.from_messages([
-        # System message for the agent's persona and general instructions
         ("system", """You are a helpful AI assistant. Your primary goal is to answer user questions accurately and comprehensively.
         
         Always prioritize 'KnowledgeBase_Search' if the question can be answered from the documents.
@@ -401,26 +350,17 @@ def get_llm_agent(
         If you cannot find an answer using any tool, state that you don't know.
         """),
         
-        # Placeholder for chat history (list of HumanMessage/AIMessage)
         MessagesPlaceholder(variable_name="chat_history"),
-        
-        # IMPORTANT: Removed MessagesPlaceholder(variable_name="tools")
-        # create_tool_calling_agent handles tool injection automatically.
-        
-        # Human message for the current input
         ("human", "{input}"),
-        
-        # Placeholder for the agent's internal thoughts, tool calls, and tool outputs
         MessagesPlaceholder(variable_name="agent_scratchpad") 
     ])
 
-    # --- 3. Create the Agent ---
     agent = create_tool_calling_agent(llm, tools, agent_prompt)
     agent_executor = AgentExecutor(
         agent=agent,
         tools=tools,
-        verbose=True, # Set to True for debugging agent's thought process in terminal
-        handle_parsing_errors=True # Important for robust agent behavior
+        verbose=True,
+        handle_parsing_errors=True
     )
     return agent_executor
 
@@ -428,18 +368,16 @@ def get_llm_agent(
 def generate_answer_with_memory(
     query,
     chat_history,
-    vector_db # Removed individual params here, will get them from session state
+    vector_db
 ):
     """Generates an answer using the LLM agent, including conversational memory and tool use."""
 
-    # Retrieve configuration parameters from session state
     llm_temperature_param = st.session_state.llm_temperature
     search_type_param = st.session_state.selected_search_type
     k_param = st.session_state.top_k_retrieval
     fetch_k_param = st.session_state.fetch_k_mmr
     lambda_mult_param = st.session_state.lambda_mult_mmr
 
-    # Get the agent executor
     agent_executor = get_llm_agent(
         vector_db,
         llm_temperature_param,
@@ -465,29 +403,17 @@ def generate_answer_with_memory(
             formatted_chat_history.append(AIMessage(content=str(msg["content"])))
 
     try:
-        # Invoke the agent executor
-        # The agent will decide whether to use KnowledgeBase_Search or Web_Search
         response = agent_executor.invoke({
             "input": processed_query,
             "chat_history": formatted_chat_history
-            # No need to pass 'tools' or 'agent_scratchpad' here; create_tool_calling_agent handles them internally
         })
 
         response_text = response.get("output", "No answer generated by agent.")
-        # The agent's output will ideally contain the answer and potentially mention sources.
-        # Extracting "source_docs" directly from agent output is more complex and usually
-        # requires parsing the agent's final output string or custom callbacks.
-        # For now, we'll indicate if it's from web or KB based on how the agent responds.
-        
-        # A more robust source display would involve inspecting agent_executor.iter()
-        # or using callbacks to capture tool usage. For simplicity, we'll rely on
-        # the agent's prompt to make it cite sources in its final output.
-        source_docs_for_display = [] # Agent will ideally put source info in response_text
-        return response_text, source_docs_for_display # Sources will be part of response_text
+        source_docs_for_display = []
+        return response_text, source_docs_for_display
 
     except Exception as e:
         st.error(f"Error generating answer with agent: {e}")
-        # When verbose=True, the traceback will be printed in the console
         return "An error occurred while trying to generate an answer. Please try again.", []
 
 
@@ -582,14 +508,12 @@ with st.sidebar.expander("Document Processing Settings", expanded=True):
     col1, col2 = st.columns(2)
 
     with col1:
-        # Store in session state
         st.session_state.chunk_size = st.slider(
             "Chunk Size",
             min_value=100, max_value=2000, value=1000, step=50,
             help="Size of text segments (characters)."
         )
     with col2:
-        # Store in session state
         st.session_state.chunk_overlap = st.slider(
             "Overlap",
             min_value=0, max_value=500, value=200, step=25,
@@ -599,7 +523,6 @@ with st.sidebar.expander("Document Processing Settings", expanded=True):
 # --- Language Model Settings (using expander) ---
 with st.sidebar.expander("Language Model Settings", expanded=True):
     st.markdown("Configure the behavior of the AI model.")
-    # Store in session state
     st.session_state.llm_temperature = st.slider(
         "LLM Temperature",
         min_value=0.0,
@@ -613,36 +536,33 @@ with st.sidebar.expander("Language Model Settings", expanded=True):
 with st.sidebar.expander("Retrieval Settings", expanded=True):
     st.markdown("Control how relevant documents are retrieved from the knowledge base (used by KnowledgeBase_Search tool).")
 
-    # Top-K Slider (applies to both search types) - Store in session state
     st.session_state.top_k_retrieval = st.slider(
         "Number of Chunks (k)",
         min_value=1,
         max_value=10,
-        value=4, # Default to 4 chunks
+        value=4,
         step=1,
         help="Number of top similar document chunks to retrieve."
     )
 
-    # Search Type Selectbox - Store in session state
     st.session_state.selected_search_type = st.selectbox(
         "Search Type",
-        options=["Similarity", "MMR"],
-        index=0, # Default to Similarity
-        help="Similarity: Retrieves most similar chunks. MMR: Maximizes relevance to query AND diversity among results."
+        options=["Similarity", "MMR"], # MMR will act as Similarity for FAISS
+        index=0,
+        help="Similarity: Retrieves most similar chunks. MMR: (Note: For FAISS, this will behave like Similarity due to direct support limitations)."
     )
 
-    # Conditional MMR Parameters - Store in session state
     if st.session_state.selected_search_type == "MMR":
-        st.markdown("MMR Parameters:")
+        st.markdown("MMR Parameters (Note: For FAISS, these parameters are not directly used, search will be similarity-based):")
         mmr_col1, mmr_col2 = st.columns(2)
         with mmr_col1:
             st.session_state.fetch_k_mmr = st.number_input(
                 "Fetch K (MMR)",
-                min_value=st.session_state.top_k_retrieval, # Must be at least 'k'
+                min_value=st.session_state.top_k_retrieval,
                 max_value=50,
-                value=max(st.session_state.top_k_retrieval, 20), # Default to top_k or 20, whichever is larger
+                value=max(st.session_state.top_k_retrieval, 20),
                 step=1,
-                help="Number of initial documents to fetch for MMR before re-ranking for diversity. Should be >= 'k'."
+                help="Ignored for FAISS; for compatibility with MMR selection."
             )
         with mmr_col2:
             st.session_state.lambda_mult_mmr = st.slider(
@@ -651,11 +571,9 @@ with st.sidebar.expander("Retrieval Settings", expanded=True):
                 max_value=1.0,
                 value=0.5,
                 step=0.05,
-                help="Diversity vs. Relevance trade-off for MMR. 0.0 = maximum diversity, 1.0 = maximum relevance (similar to similarity search)."
+                help="Ignored for FAISS; for compatibility with MMR selection."
             )
     else:
-        # Ensure these are set to default or reasonable values if MMR is not selected
-        # This prevents NameErrors if MMR parameters are accessed when Similarity is chosen
         if "fetch_k_mmr" not in st.session_state:
              st.session_state.fetch_k_mmr = 20
         if "lambda_mult_mmr" not in st.session_state:
@@ -668,7 +586,6 @@ st.sidebar.subheader("Load from URL")
 url_col, button_col = st.sidebar.columns([3, 1])
 
 with url_col:
-    # Use st.session_state.url_input_key to ensure input clears on refresh
     url_input = st.text_input("Enter URL", label_visibility="collapsed", placeholder="Enter a URL to load...", key=f"url_input_{st.session_state.url_input_key}")
 
 with button_col:
@@ -676,24 +593,23 @@ with button_col:
 
 
 # --- Initial Load/Check for Existing DB ---
-# This block attempts to load an existing DB when the app first starts or reruns
+# This block attempts to load an existing DB from session state when the app first starts or reruns
 if st.session_state.vector_db is None and st.session_state.current_content_source is None:
     embedding_function = get_embedding_function()
-    st.session_state.vector_db = get_vector_store(
-        text_chunks=[], # Pass empty chunks to trigger loading from disk
+    st.session_state.vector_db = _load_or_create_vector_store(
+        text_chunks=[], # Pass empty chunks to trigger loading from session state
         embedding_function=embedding_function,
-        collection_name=DEFAULT_COLLECTION_NAME
+        collection_name=st.session_state.current_collection_name # Use current collection name
     )
     if st.session_state.vector_db:
-        # If successfully loaded, update current_content_source
-        st.session_state.current_content_source = f"Pre-existing knowledge base ({st.session_state.current_collection_name})"
+        # If successfully loaded from session state, update current_content_source
+        st.session_state.current_content_source = f"Pre-existing knowledge base (in-memory: {st.session_state.current_collection_name})"
 
 
 # --- Handle Document Upload (triggered by file_uploader or Load File button) ---
-# If a file is uploaded AND it's a new file (not already processed)
 if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_filename", ""):
-    st.session_state.messages = [] # Clear chat on new document
-    st.session_state.last_uploaded_filename = uploaded_file.name # Store for next rerun check
+    st.session_state.messages = []
+    st.session_state.last_uploaded_filename = uploaded_file.name
 
     with st.spinner(f"Processing document '{uploaded_file.name}'..."):
         text_chunks = process_document_to_chunks(uploaded_file, st.session_state.chunk_size, st.session_state.chunk_overlap)
@@ -706,19 +622,18 @@ if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_f
         if st.session_state.vector_db:
             st.session_state.current_content_source = uploaded_file.name
             st.toast(f"Knowledge base ready for '{uploaded_file.name}'! You can now ask questions.", icon="🎉")
-            st.rerun() # Rerun to update UI and prevent reprocessing on subsequent renders
+            st.rerun()
     else:
         st.session_state.vector_db = None
         st.session_state.current_content_source = None
-        st.session_state.uploaded_file_key += 1 # Increment key to clear uploader
-        st.rerun() # Rerun to clear input if processing failed
+        st.session_state.uploaded_file_key += 1
+        st.rerun()
 
 
 # --- Handle URL Loading (triggered by Load URL button) ---
-# Check if button was clicked AND url_input is not empty AND it's a new URL
 if load_url_button and url_input and url_input != st.session_state.get("last_loaded_url", ""):
-    st.session_state.messages = [] # Clear chat on new document
-    st.session_state.last_loaded_url = url_input # Store for next rerun check
+    st.session_state.messages = []
+    st.session_state.last_loaded_url = url_input
 
     text_chunks = process_url_to_chunks(url_input, st.session_state.chunk_size, st.session_state.chunk_overlap)
 
@@ -730,13 +645,13 @@ if load_url_button and url_input and url_input != st.session_state.get("last_loa
         if st.session_state.vector_db:
             st.session_state.current_content_source = url_input
             st.toast(f"Knowledge base ready for '{url_input}'! You can now ask questions.", icon="🎉")
-            st.session_state.url_input_key += 1 # Increment key to clear url input
-            st.rerun() # Rerun to update UI and prevent reprocessing on subsequent renders
+            st.session_state.url_input_key += 1
+            st.rerun()
     else:
         st.session_state.vector_db = None
         st.session_state.current_content_source = None
-        st.session_state.url_input_key += 1 # Increment key to clear url input
-        st.rerun() # Rerun to clear input if processing failed
+        st.session_state.url_input_key += 1
+        st.rerun()
 
 
 # --- Display Current Knowledge Base Status ---
@@ -749,37 +664,30 @@ else:
 
 
 # --- Chat Interface ---
-# Initialize messages if empty (should happen on first run or clear chat)
 if not st.session_state.messages:
     initial_ai_response = "Hi there! I'm your RAG chatbot. I can answer questions about the document or URL you provide, and now also search the web for general knowledge!"
     st.session_state.messages = [{"role": "assistant", "content": initial_ai_response}]
 
-# Display chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-# Chat input
 if query := st.chat_input("Ask a question..."):
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.write(query)
 
     with st.spinner("Thinking... (The agent is deciding whether to use the knowledge base or web search...)"):
-        # The agent now handles whether vector_db is None or not internally
         response_text, source_docs = generate_answer_with_memory(
             query,
-            st.session_state.messages[:-1], # Pass all but the current user message for chat history
-            st.session_state.vector_db # Now generate_answer_with_memory gets params from session state
+            st.session_state.messages[:-1],
+            st.session_state.vector_db
         )
 
     st.session_state.messages.append({"role": "assistant", "content": response_text})
     with st.chat_message("assistant"):
         st.write(response_text)
 
-        # Removed the automatic source display for now, as agent will embed source info in its output
-        # If you want structured source display, you'd need more advanced parsing of agent.invoke() output
-        # or custom callbacks to trace tool usage.
 
 # --- Sidebar: Clear Chat and Reset RAG ---
 st.sidebar.markdown("---")
@@ -793,12 +701,10 @@ if st.sidebar.button("Clear Chat and Reset RAG Data"):
     st.session_state.uploaded_file_key += 1
     st.session_state.last_uploaded_filename = ""
     st.session_state.last_loaded_url = ""
-
-    if os.path.exists(CHROMA_DB_PATH):
-        try:
-            shutil.rmtree(CHROMA_DB_PATH)
-            st.toast("ChromaDB cleared from disk!", icon="🗑️")
-        except Exception as e:
-            st.error(f"Error clearing ChromaDB directory: {e}")
+    
+    # Clear all FAISS indexes stored in session state
+    if 'faiss_indexes' in st.session_state:
+        st.session_state.faiss_indexes = {}
+        st.toast("In-memory knowledge bases cleared!", icon="🗑️")
 
     st.rerun()
