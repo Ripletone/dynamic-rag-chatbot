@@ -30,7 +30,7 @@ from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader, TextLoader, UnstructuredMarkdownLoader, Docx2txtLoader
+from langchain_community.document.loaders import PyPDFLoader, WebBaseLoader, TextLoader, UnstructuredMarkdownLoader, Docx2txtLoader
 from langchain_core.documents import Document # Import Document class if not already
 
 
@@ -60,7 +60,9 @@ def initialize_session_state():
         st.session_state.current_collection_name = DEFAULT_COLLECTION_NAME
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    # Removed url_input_key counter, using static key now
+    # Re-introducing url_input_key as a counter for text_input's key
+    if "url_input_key" not in st.session_state:
+        st.session_state.url_input_key = 0
     if "uploaded_file_key" not in st.session_state:
         st.session_state.uploaded_file_key = 0
 
@@ -78,9 +80,7 @@ def initialize_session_state():
     if "faiss_indexes" not in st.session_state:
         st.session_state.faiss_indexes = {}
 
-    # New: Key for the URL text input widget, will hold its value
-    if "url_input_widget_key" not in st.session_state:
-        st.session_state["url_input_widget_key"] = ""
+    # Removed url_input_widget_key as a static key for value, now using dynamic key
     if "last_loaded_url" not in st.session_state:
         st.session_state["last_loaded_url"] = ""
 
@@ -407,50 +407,6 @@ def generate_answer_with_memory(
         return "An error occurred while trying to generate an answer. Please try again.", []
 
 
-# --- Callback function for st.text_input (triggered on change) ---
-def handle_url_input_change():
-    """
-    This function is called by Streamlit's on_change event for the URL input.
-    It triggers the URL loading and processing logic.
-    """
-    url = st.session_state.url_input_widget_key # Access the current value from the text_input
-
-    if not url or not url.strip(): # If URL input is empty or just whitespace
-        if st.session_state.vector_db is not None:
-            st.warning("URL input cleared. Resetting knowledge base and chat history.")
-            st.session_state.vector_db = None # Clear your knowledge base
-            st.session_state.current_content_source = None
-            st.session_state.messages = [] # Also clear chat history
-            st.session_state.last_loaded_url = "" # Reset last loaded URL
-            if 'faiss_indexes' in st.session_state:
-                st.session_state.faiss_indexes = {} # Clear in-memory indexes too
-            st.rerun() # Force a rerun to clear UI immediately
-        return
-
-    # Check if this URL is already the one we last loaded
-    if url == st.session_state.get("last_loaded_url", ""):
-        st.info("This URL is already loaded or is currently being processed.")
-        return # Do nothing if same URL
-
-    # It's a new, non-empty URL, so process it
-    st.session_state.messages = [] # Clear chat history for new content
-
-    # Process the URL
-    text_chunks = process_url_to_chunks(url, st.session_state.chunk_size, st.session_state.chunk_overlap)
-
-    if text_chunks:
-        manage_vector_store(text_chunks=text_chunks, collection_name=get_url_collection_name(url))
-        st.toast(f"Knowledge base ready for '{url}'! You can now ask questions.", icon="🎉") # Corrected icon
-        st.session_state.last_loaded_url = url # Update the last loaded URL
-        st.rerun() # Trigger a rerun to update the UI with the new knowledge base status
-    else:
-        st.session_state.vector_db = None
-        st.session_state.current_content_source = None
-        st.session_state.last_loaded_url = "" # Clear last loaded URL on failure
-        st.error("Failed to load URL content. Please check the URL and try again.")
-        # No rerun here if it's an error, let the user see the error message.
-
-
 # --- Main Streamlit App Layout and Logic ---
 
 st.markdown(
@@ -475,7 +431,7 @@ st.markdown(
         padding: 10px 15px;
         background-color: #f8fcf8;
         color: #333 !important;
-        box_shadow: 0 2px 4px rgba[0,0,0,0.1];
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         font-family: sans-serif !important;
         font-weight: normal !important;
     }
@@ -487,7 +443,7 @@ st.markdown(
         padding: 12px 20px;
         background-color: #eaf6ff;
         color: #333 !important;
-        box_shadow: 0 2px 5px rgba[0,0,0,0.15];
+        box-shadow: 0 2px 5px rgba(0,0,0,0.15);
         font-family: sans-serif !important;
         font-weight: normal !important;
     }
@@ -499,7 +455,7 @@ st.markdown(
         padding: 5px 15px;
         margin-top: 20px;
         background-color: #f1f8f9;
-        box_shadow: 0 1px 3px rgba[0,0,0,0.08];
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
 
     /* Optional: Style for the chat message boxes themselves */
@@ -508,7 +464,7 @@ st.markdown(
         border-radius: 12px;
         padding: 15px;
         margin-bottom: 10px;
-        box-shadow: 0 1px 3px rgba[0,0,0,0.05];
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     }
 
     .stChatMessage.st-chat-message-user {
@@ -612,19 +568,23 @@ with st.sidebar.expander("Retrieval Settings", expanded=True):
             st.session_state.lambda_mult_mmr = 0.5
 
 
-# --- Load from URL (automatic via on_change) ---
+# --- Load from URL (using columns for input and button) ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("Load from URL")
+url_col, button_col = st.sidebar.columns([3, 1])
 
-# The URL text input now directly triggers the loading logic on change
-st.sidebar.text_input(
-    "Enter URL",
-    label_visibility="collapsed",
-    placeholder="Enter a URL to load (e.g., https://example.com)...",
-    key="url_input_widget_key",        # Static key for reliable on_change reference
-    on_change=handle_url_input_change, # The callback function
-    value=st.session_state.get("url_input_widget_key", "") # Preserve the input text
-)
+with url_col:
+    # Use a dynamic key for the text input to allow easy clearing
+    url_input = st.text_input(
+        "Enter URL",
+        label_visibility="collapsed",
+        placeholder="Enter a URL to load (e.g., https://example.com)...",
+        key=f"url_input_{st.session_state.url_input_key}", # Dynamic key based on counter
+        # Removed on_change to simplify state management
+    )
+
+with button_col:
+    load_url_button = st.button("Load", key="load_url_button", use_container_width=True)
 
 
 # --- Initial Load/Check for Existing DB ---
@@ -634,35 +594,47 @@ manage_vector_store(collection_name=st.session_state.current_collection_name)
 
 
 # --- Handle Document Upload (triggered by file_uploader) ---
-# Check if a new file has been uploaded
 if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_filename", ""):
-    st.session_state.messages = [] # Clear chat on new upload
-    st.session_state.last_uploaded_filename = uploaded_file.name # Track last uploaded file
+    st.session_state.messages = []
+    st.session_state.last_uploaded_filename = uploaded_file.name
 
     with st.spinner(f"Processing document '{uploaded_file.name}'..."):
         text_chunks = process_document_to_chunks(uploaded_file, st.session_state.chunk_size, st.session_state.chunk_overlap)
 
     if text_chunks:
-        # Pass the cleaned filename as the collection name
         manage_vector_store(text_chunks=text_chunks, collection_name=clean_collection_name(os.path.splitext(uploaded_file.name)[0]))
         st.toast(f"Knowledge base ready for '{uploaded_file.name}'! You can now ask questions.", icon="🎉")
-        st.rerun() # Rerun to update the UI immediately
+        st.rerun()
     else:
         st.session_state.vector_db = None
         st.session_state.current_content_source = None
         st.session_state.uploaded_file_key += 1 # Increment key to force re-render of file uploader if needed
-        st.rerun() # Rerun to clear any old state
+        st.rerun()
+
+
+# --- Handle URL Loading (triggered by Load URL button) ---
+if load_url_button and url_input and url_input != st.session_state.get("last_loaded_url", ""):
+    st.session_state.messages = []
+    st.session_state.last_loaded_url = url_input
+
+    text_chunks = process_url_to_chunks(url_input, st.session_state.chunk_size, st.session_state.chunk_overlap)
+
+    if text_chunks:
+        manage_vector_store(text_chunks=text_chunks, collection_name=get_url_collection_name(url_input))
+        st.toast(f"Knowledge base ready for '{url_input}'! You can now ask questions.", icon="🎉")
+        st.session_state.url_input_key += 1 # Increment key to clear the input field on rerun
+        st.rerun()
+    else:
+        st.session_state.vector_db = None
+        st.session_state.current_content_source = None
+        st.session_state.last_loaded_url = "" # Clear last loaded URL on failure
+        st.session_state.url_input_key += 1 # Increment key to clear the input field on rerun
+        st.rerun()
 
 
 # --- Display Current Knowledge Base Status ---
-# This line was missing initialization for current_loading_url_status.
-# Adding a default here to prevent error if it's not set by handle_url_input_change yet.
-if "current_loading_url_status" not in st.session_state:
-    st.session_state.current_loading_url_status = None
-
-if st.session_state.current_loading_url_status: # Check for ongoing loading status from handle_url_input_change
-    st.info(st.session_state.current_loading_url_status)
-elif st.session_state.vector_db is None:
+# Removed current_loading_url_status check, as it's not being set consistently
+if st.session_state.vector_db is None:
     st.toast("Please upload a document or load a URL to begin.", icon="⬆️")
     st.write("Current status: No knowledge base loaded.")
 elif st.session_state.current_content_source:
@@ -706,21 +678,14 @@ if st.sidebar.button("Clear Chat and Reset RAG Data"):
     st.session_state.current_content_source = None
     st.session_state.current_collection_name = DEFAULT_COLLECTION_NAME
 
-    # Clear input fields by resetting their values in session state
-    st.session_state["url_input_widget_key"] = ""
-    st.session_state["last_loaded_url"] = ""
-    st.session_state["last_uploaded_filename"] = ""
-
-    # Increment uploaded_file_key to reset file uploader widget
-    st.session_state.uploaded_file_key += 1
-
-    # ONLY remove url_input_key if it exists and is still causing issues for state.
-    # It should effectively be removed by the on_change refactor.
-    if "url_input_key" in st.session_state:
-        del st.session_state["url_input_key"] # Ensure old key is gone if it was causing issues
+    # Increment keys to clear input fields
+    st.session_state.url_input_key += 1 # Increment to clear URL text input
+    st.session_state.uploaded_file_key += 1 # Increment to clear file uploader
+    st.session_state.last_uploaded_filename = ""
+    st.session_state.last_loaded_url = ""
 
     if 'faiss_indexes' in st.session_state:
-        st.session_state.faiss_indexes = {} # Clear all in-memory FAISS indexes
+        st.session_state.faiss_indexes = {}
         st.toast("In-memory knowledge bases cleared!", icon="🗑️")
 
     st.rerun() # Force a full rerun to reflect all changes
