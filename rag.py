@@ -1,5 +1,8 @@
 import streamlit as st
-st.write("DEBUG: Running version from [Current Date/Time, e.g., June 9, 3:15 PM]")
+
+# --- Page Configuration (MUST BE THE FIRST STREAMLIT COMMAND) ---
+st.set_page_config(page_title="Dynamic RAG Chatbot with Memory", layout="wide")
+
 import os
 import google.generativeai as genai
 from langchain.chains.combine_documents import create_stuff_documents_chain
@@ -8,7 +11,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableParallel
 from langchain_core.messages import HumanMessage, AIMessage
 from operator import itemgetter
-import shutil 
+import shutil
 import re
 from urllib.parse import urlparse
 
@@ -17,6 +20,7 @@ from langchain_community.tools import DuckDuckGoSearchResults
 from langchain.tools import Tool
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain.tools.retriever import create_retriever_tool
+
 # CRITICAL FIX: Use nest_asyncio to handle event loop conflicts in Streamlit
 import nest_asyncio
 nest_asyncio.apply()
@@ -59,7 +63,7 @@ def initialize_session_state():
     # Removed url_input_key counter, using static key now
     if "uploaded_file_key" not in st.session_state:
         st.session_state.uploaded_file_key = 0
-    
+
     if "llm_temperature" not in st.session_state:
         st.session_state.llm_temperature = 0.0
     if "top_k_retrieval" not in st.session_state:
@@ -70,10 +74,10 @@ def initialize_session_state():
         st.session_state.fetch_k_mmr = 20
     if "lambda_mult_mmr" not in st.session_state:
         st.session_state.lambda_mult_mmr = 0.5
-    
+
     if "faiss_indexes" not in st.session_state:
         st.session_state.faiss_indexes = {}
-    
+
     # New: Key for the URL text input widget, will hold its value
     if "url_input_widget_key" not in st.session_state:
         st.session_state["url_input_widget_key"] = ""
@@ -132,7 +136,7 @@ def _load_or_create_faiss_index(text_chunks, collection_name_for_cache):
     This function directly manages st.session_state.faiss_indexes.
     """
     # embedding_function is called here. Its UI feedback (spinner/toast) is handled in manage_vector_store.
-    embedding_function = get_embedding_function() 
+    embedding_function = get_embedding_function()
 
     if text_chunks:
         try:
@@ -151,7 +155,7 @@ def _load_or_create_faiss_index(text_chunks, collection_name_for_cache):
             return None
     else:
         faiss_index = st.session_state.faiss_indexes.get(collection_name_for_cache)
-        
+
         if faiss_index:
             st.toast(f"Knowledge base collection '{collection_name_for_cache}' loaded from session state!", icon="📚")
             return faiss_index
@@ -172,7 +176,7 @@ def manage_vector_store(text_chunks=None, collection_name=DEFAULT_COLLECTION_NAM
     with st.spinner("Loading embedding model (if not already cached)..."):
         # Calling get_embedding_function here will trigger the cache if needed.
         # We don't need to assign its output, just ensure it's loaded.
-        _ = get_embedding_function() 
+        _ = get_embedding_function()
     st.toast("Embedding model ready!", icon="✅")
 
 
@@ -301,7 +305,7 @@ def get_llm_agent(
         # for vector stores that explicitly support MMR (like Chroma, not FAISS).
         # So, for FAISS, we'll always use similarity search.
         retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param})
-        
+
         if search_type_param == "MMR":
             st.warning("MMR search type is not directly supported by FAISS retriever. Using 'similarity' instead.")
             # If you were using a different vector store that supports MMR, you might do:
@@ -326,19 +330,19 @@ def get_llm_agent(
     if not tools:
         st.warning("No tools are available for the agent. Please load a document or ensure tools are correctly defined.")
         return None
-    
+
     agent_prompt = ChatPromptTemplate.from_messages([
         ("system", """You are a helpful AI assistant. Your primary goal is to answer user questions accurately and comprehensively.
-        
+
         Always prioritize 'KnowledgeBase_Search' if the question can be answered from the documents.
         If you use 'Web_Search', aim to summarize relevant information and indicate that it came from the web (e.g., "According to a web search...").
         If you use 'KnowledgeBase_Search', indicate that it came from the knowledge base (e.g., "From the knowledge base...").
         If you cannot find an answer using any tool, state that you don't know.
         """),
-        
+
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad") 
+        MessagesPlaceholder(variable_name="agent_scratchpad")
     ])
 
     agent = create_tool_calling_agent(llm, tools, agent_prompt)
@@ -430,7 +434,7 @@ def handle_url_input_change():
 
     # It's a new, non-empty URL, so process it
     st.session_state.messages = [] # Clear chat history for new content
-    
+
     # Process the URL
     text_chunks = process_url_to_chunks(url, st.session_state.chunk_size, st.session_state.chunk_overlap)
 
@@ -448,8 +452,6 @@ def handle_url_input_change():
 
 
 # --- Main Streamlit App Layout and Logic ---
-
-st.set_page_config(page_title="Dynamic RAG Chatbot with Memory", layout="wide")
 
 st.markdown(
     """
@@ -473,7 +475,7 @@ st.markdown(
         padding: 10px 15px;
         background-color: #f8fcf8;
         color: #333 !important;
-        box_shadow: 0 2px 4px rgba(0,0,0,0.1);
+        box_shadow: 0 2px 4px rgba[0,0,0,0.1];
         font-family: sans-serif !important;
         font-weight: normal !important;
     }
@@ -485,7 +487,7 @@ st.markdown(
         padding: 12px 20px;
         background-color: #eaf6ff;
         color: #333 !important;
-        box_shadow: 0 2px 5px rgba(0,0,0,0.15);
+        box_shadow: 0 2px 5px rgba[0,0,0,0.15];
         font-family: sans-serif !important;
         font-weight: normal !important;
     }
@@ -497,7 +499,7 @@ st.markdown(
         padding: 5px 15px;
         margin-top: 20px;
         background-color: #f1f8f9;
-        box_shadow: 0 1px 3px rgba(0,0,0,0.08);
+        box_shadow: 0 1px 3px rgba[0,0,0,0.08];
     }
 
     /* Optional: Style for the chat message boxes themselves */
@@ -506,7 +508,7 @@ st.markdown(
         border-radius: 12px;
         padding: 15px;
         margin-bottom: 10px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        box-shadow: 0 1px 3px rgba[0,0,0,0.05];
     }
 
     .stChatMessage.st-chat-message-user {
@@ -653,6 +655,11 @@ if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_f
 
 
 # --- Display Current Knowledge Base Status ---
+# This line was missing initialization for current_loading_url_status.
+# Adding a default here to prevent error if it's not set by handle_url_input_change yet.
+if "current_loading_url_status" not in st.session_state:
+    st.session_state.current_loading_url_status = None
+
 if st.session_state.current_loading_url_status: # Check for ongoing loading status from handle_url_input_change
     st.info(st.session_state.current_loading_url_status)
 elif st.session_state.vector_db is None:
@@ -703,7 +710,7 @@ if st.sidebar.button("Clear Chat and Reset RAG Data"):
     st.session_state["url_input_widget_key"] = ""
     st.session_state["last_loaded_url"] = ""
     st.session_state["last_uploaded_filename"] = ""
-    
+
     # Increment uploaded_file_key to reset file uploader widget
     st.session_state.uploaded_file_key += 1
 
