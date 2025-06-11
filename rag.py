@@ -4,22 +4,10 @@ import streamlit as st
 st.set_page_config(page_title="Dynamic RAG Chatbot with Memory", layout="wide")
 
 import os
-import google.generativeai as genai
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
-from langchain_core.messages import HumanMessage, AIMessage
 from operator import itemgetter
 import shutil
 import re
 from urllib.parse import urlparse
-
-# New imports for Agents and DuckDuckGo search
-from langchain_community.tools import DuckDuckGoSearchResults
-from langchain.tools import Tool
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.tools.retriever import create_retriever_tool
 
 # CRITICAL FIX: Use nest_asyncio to handle event loop conflicts in Streamlit
 import nest_asyncio
@@ -27,11 +15,26 @@ nest_asyncio.apply()
 
 # LangChain Imports - NOW USING FAISS INSTEAD OF CHROMA
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.document.loaders import PyPDFLoader, WebBaseLoader, TextLoader, UnstructuredMarkdownLoader, Docx2txtLoader
-from langchain_core.documents import Document # Import Document class if not already
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.tools import Tool # Re-importing Tool from langchain_core for explicit usage
+
+# DIRECT IMPORTS for Document Loading and Tools (replaces langchain_community)
+import pypdf
+import requests
+from bs4 import BeautifulSoup
+from docx import Document as DocxDocument
+import markdown # if using markdown files
+from duckduckgo_search import DDGS
+
+# FAISS direct import
+import faiss
+import numpy as np
 
 
 # --- Configuration Constants ---
@@ -46,8 +49,6 @@ try:
 except KeyError:
     st.error("`GOOGLE_API_KEY` not found in `.streamlit/secrets.toml`. Please add it to your secrets file.")
     st.stop()
-
-genai.configure(api_key=GOOGLE_API_KEY)
 
 
 # --- Streamlit Session State Initialization ---
@@ -80,9 +81,11 @@ def initialize_session_state():
     if "faiss_indexes" not in st.session_state:
         st.session_state.faiss_indexes = {}
 
-    # Removed url_input_widget_key as a static key for value, now using dynamic key
     if "last_loaded_url" not in st.session_state:
         st.session_state["last_loaded_url"] = ""
+    # New session state variable to reliably store the URL submitted by the button
+    if "submitted_url" not in st.session_state:
+        st.session_state.submitted_url = ""
 
 
 initialize_session_state()
@@ -121,6 +124,59 @@ def get_url_collection_name(url: str) -> str:
     return clean_collection_name(combined_name)
 
 
+# --- Custom Document Loading Functions (Replacing langchain_community.document.loaders) ---
+
+def load_documents_from_file(file_path: str) -> list[Document]:
+    """Loads content from a file using direct library calls."""
+    documents = []
+    content = ""
+    try:
+        file_extension = os.path.splitext(file_path)[1].lower()
+        if file_extension == ".pdf":
+            with open(file_path, "rb") as f:
+                reader = pypdf.PdfReader(f)
+                for page in reader.pages:
+                    content += page.extract_text() or ""
+        elif file_extension == ".md":
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        elif file_extension == ".docx":
+            doc = DocxDocument(file_path)
+            for para in doc.paragraphs:
+                content += para.text + "\n"
+        elif file_extension == ".txt":
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            st.error(f"Unsupported file type: {file_extension}. Only PDF, TXT, MD, DOCX supported for direct loading.")
+            return []
+        documents.append(Document(page_content=content, metadata={"source": file_path, "file_name": os.path.basename(file_path)}))
+    except Exception as e:
+        st.error(f"Error loading file {file_path}: {e}")
+        return []
+    return documents
+
+def load_documents_from_url(url: str) -> list[Document]:
+    """Loads content from a URL using direct library calls."""
+    documents = []
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status() # Raise an exception for HTTP errors
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # Extract readable text from the HTML, removing script/style tags
+        for script_or_style in soup(["script", "style"]):
+            script_or_style.extract()
+        text_content = soup.get_text(separator=' ', strip=True)
+        documents.append(Document(page_content=text_content, metadata={"source": url}))
+    except requests.exceptions.RequestException as e:
+        st.error(f"Error fetching URL {url}: {e}")
+        return []
+    except Exception as e:
+        st.error(f"Error parsing URL content from {url}: {e}")
+        return []
+    return documents
+
+
 # --- Caching and Document Handling Functions ---
 
 @st.cache_resource
@@ -130,19 +186,90 @@ def get_embedding_function():
     return embeddings
 
 
+# This CustomFAISSVectorStore class is a simplified wrapper for direct faiss-cpu usage,
+# to mimic some behavior of langchain-community's FAISS, specifically for retrieval.
+# It's NOT a full replacement for all langchain-community.vectorstores.FAISS methods
+# like 'from_documents' or 'as_retriever' directly.
+# The 'as_retriever' method here returns a custom RetrieverWrapper.
+class CustomFAISSVectorStore:
+    def __init__(self, embeddings_model, documents=None, dim=None):
+        self.embeddings_model = embeddings_model
+        self.index = None
+        self.doc_store = [] # To store original documents and their content for retrieval
+        self.dim = dim # Dimension of embeddings
+
+        if documents:
+            self.add_documents(documents)
+
+    def add_documents(self, documents: list[Document]):
+        if not documents:
+            return
+
+        # Get embeddings for new documents
+        texts = [doc.page_content for doc in documents]
+        # Ensure embeddings are numpy arrays
+        new_embeddings = np.array(self.embeddings_model.embed_documents(texts), dtype=np.float32)
+
+        if self.index is None:
+            self.dim = new_embeddings.shape[1]
+            self.index = faiss.IndexFlatL2(self.dim) # L2 distance (Euclidean)
+            self.doc_store = documents # Initialize doc_store with the first set of documents
+        else:
+            self.doc_store.extend(documents) # Extend if index already exists
+
+        # Add vectors to the FAISS index
+        self.index.add(new_embeddings)
+
+    def similarity_search_with_score(self, query: str, k: int = 4) -> list[tuple[Document, float]]:
+        query_embedding = np.array(self.embeddings_model.embed_query(query), dtype=np.float32).reshape(1, -1)
+        
+        if self.index is None or self.index.ntotal == 0:
+            return []
+        
+        distances, indices = self.index.search(query_embedding, k)
+        
+        results = []
+        for i, dist in zip(indices[0], distances[0]):
+            if i >= 0 and i < len(self.doc_store): # Ensure index is valid and within bounds
+                results.append((self.doc_store[i], float(dist)))
+        return results
+
+    def as_retriever(self, search_type="similarity", search_kwargs={}):
+        # This is a simplified retriever to avoid direct langchain.vectorstores.FAISS dependency.
+        # It won't support all features of LangChain's native FAISS retriever.
+        # For agent functionality, this part will need the LangChain ecosystem.
+        if search_type == "similarity":
+            k = search_kwargs.get("k", 4)
+            return RetrieverWrapper(self, k)
+        else:
+            st.warning("Only 'similarity' search type is supported by the custom FAISS wrapper. Defaulting to similarity.")
+            return RetrieverWrapper(self, search_kwargs.get("k", 4))
+
+class RetrieverWrapper:
+    # A simple wrapper to make CustomFAISSVectorStore usable as a retriever
+    def __init__(self, vector_store_instance, k):
+        self.vector_store_instance = vector_store_instance
+        self.k = k
+
+    def get_relevant_documents(self, query: str) -> list[Document]:
+        results_with_score = self.vector_store_instance.similarity_search_with_score(query, k=self.k)
+        # Return only the documents (discard scores for this interface)
+        return [doc for doc, score in results_with_score]
+
+
 def _load_or_create_faiss_index(text_chunks, collection_name_for_cache):
     """
     Internal function to create or load a FAISS vector store.
     This function directly manages st.session_state.faiss_indexes.
     """
-    # embedding_function is called here. Its UI feedback (spinner/toast) is handled in manage_vector_store.
     embedding_function = get_embedding_function()
 
     if text_chunks:
         try:
-            faiss_index = FAISS.from_documents(
-                documents=text_chunks,
-                embedding=embedding_function
+            # Using the custom FAISS wrapper here
+            faiss_index = CustomFAISSVectorStore(
+                embeddings_model=embedding_function,
+                documents=text_chunks
             )
             st.session_state.faiss_indexes[collection_name_for_cache] = faiss_index
             st.toast(f"Knowledge base collection '{collection_name_for_cache}' created/updated successfully with {len(text_chunks)} chunks!", icon="✨")
@@ -172,13 +299,9 @@ def manage_vector_store(text_chunks=None, collection_name=DEFAULT_COLLECTION_NAM
     cleaned_collection_name = clean_collection_name(collection_name)
     st.session_state.current_collection_name = cleaned_collection_name
 
-    # This is where the UI feedback for embedding model loading should happen.
     with st.spinner("Loading embedding model (if not already cached)..."):
-        # Calling get_embedding_function here will trigger the cache if needed.
-        # We don't need to assign its output, just ensure it's loaded.
         _ = get_embedding_function()
     st.toast("Embedding model ready!", icon="✅")
-
 
     if text_chunks is not None and len(text_chunks) > 0:
         st.info(f"Processing content for in-memory knowledge base '{cleaned_collection_name}'...")
@@ -203,7 +326,7 @@ def manage_vector_store(text_chunks=None, collection_name=DEFAULT_COLLECTION_NAM
 
 @st.cache_data(show_spinner=False)
 def process_document_to_chunks(uploaded_file, chunk_size, chunk_overlap):
-    """Loads and splits an uploaded document into text chunks."""
+    """Loads and splits an uploaded document into text chunks using direct loaders."""
     if uploaded_file is None:
         return []
 
@@ -217,22 +340,9 @@ def process_document_to_chunks(uploaded_file, chunk_size, chunk_overlap):
 
         st.info(f"Loading document: {uploaded_file.name}")
 
-        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
-        loader = None
+        # Use custom direct loading function
+        documents = load_documents_from_file(temp_file_path)
 
-        if file_extension == ".pdf":
-            loader = PyPDFLoader(temp_file_path)
-        elif file_extension == ".txt":
-            loader = TextLoader(temp_file_path)
-        elif file_extension == ".md":
-            loader = UnstructuredMarkdownLoader(temp_file_path)
-        elif file_extension == ".docx":
-            loader = Docx2txtLoader(temp_file_path)
-        else:
-            st.error(f"Unsupported file type: **{file_extension}**. Please upload a PDF, TXT, MD, or DOCX file.")
-            return []
-
-        documents = loader.load()
         if not documents:
             st.warning(f"No content found in {uploaded_file.name}.")
             return []
@@ -253,15 +363,16 @@ def process_document_to_chunks(uploaded_file, chunk_size, chunk_overlap):
 
 @st.cache_data(show_spinner=False)
 def process_url_to_chunks(url_input, chunk_size, chunk_overlap):
-    """Loads and splits content from a URL into text chunks."""
+    """Loads and splits content from a URL into text chunks using direct loaders."""
     if not url_input:
         return []
 
     with st.status(f"Loading content from URL: {url_input}...", expanded=True) as status_message:
         try:
             status_message.write("1. Fetching content from URL...")
-            loader = WebBaseLoader(url_input)
-            documents = loader.load()
+            # Use custom direct loading function
+            documents = load_documents_from_url(url_input)
+
             if not documents:
                 raise ValueError("No content extracted from URL.")
             status_message.write(f"2. Extracted {len(documents)} document(s).")
@@ -279,6 +390,23 @@ def process_url_to_chunks(url_input, chunk_size, chunk_overlap):
             st.error(f"Error loading URL: {e}")
             return []
 
+# --- IMPORTANT: Agent and Chain Dependencies ---
+# The following functions (get_llm_agent, generate_answer_with_memory using AgentExecutor,
+# create_tool_calling_agent, create_retriever_tool) are part of the main 'langchain'
+# package which conflicts with 'langchain-google-genai 2.x' due to 'langchain-core' versions.
+#
+# To make this code run with 'langchain-google-genai==2.1.5' (for Gemini 1.5-flash-latest),
+# you MUST ensure 'langchain' (the main package) is NOT in your requirements.txt.
+#
+# If 'langchain' is removed, these functions will cause ModuleNotFoundError.
+# Replacing them requires significant refactoring to manually implement agent logic,
+# tool calling, and chain orchestration using only 'langchain_core' or direct API calls.
+#
+# For now, I'm leaving this section with a fallback mechanism.
+# The 'try-except ImportError' blocks will attempt to use LangChain's agent components.
+# If they fail (because 'langchain' is not installed), a simpler RAG chain will be used,
+# which will NOT use tools dynamically (only the knowledge base if available).
+
 # Agent for flexible tool use
 def get_llm_agent(
     vector_db,
@@ -290,6 +418,9 @@ def get_llm_agent(
 ):
     """
     Constructs and returns an LLM Agent capable of using a RAG retriever and a web search tool.
+    NOTE: This function attempts to use LangChain Agent components which might conflict with
+    langchain-google-genai 2.x unless the 'langchain' package is compatible or removed.
+    If 'langchain' is not installed, it falls back to a simpler RAG chain without dynamic tool use.
     """
     llm = ChatGoogleGenerativeAI(
         model=GEMINI_MODEL_NAME,
@@ -299,31 +430,45 @@ def get_llm_agent(
 
     tools = []
 
+    # --- Knowledge Base Tool ---
     if vector_db:
-        # Note: FAISS's .as_retriever() uses similarity search by default.
-        # MMR parameters fetch_k and lambda_mult are part of the retriever's constructor
-        # for vector stores that explicitly support MMR (like Chroma, not FAISS).
-        # So, for FAISS, we'll always use similarity search.
-        retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param})
+        try:
+            # Attempt to import from the full langchain package
+            from langchain.tools.retriever import create_retriever_tool
+            retriever = vector_db.as_retriever(search_type="similarity", search_kwargs={"k": k_param})
 
-        if search_type_param == "MMR":
-            st.warning("MMR search type is not directly supported by FAISS retriever. Using 'similarity' instead.")
-            # If you were using a different vector store that supports MMR, you might do:
-            # retriever = vector_db.as_retriever(search_type="mmr", search_kwargs={"k": k_param, "fetch_k": fetch_k_param, "lambda_mult": lambda_mult_param})
+            if search_type_param == "MMR":
+                st.warning("MMR search type is not directly supported by FAISS retriever. Using 'similarity' instead.")
+
+            knowledge_base_tool = create_retriever_tool(
+                retriever,
+                name="KnowledgeBase_Search",
+                description="Searches and returns information from the user-provided documents in the knowledge base. Use this for questions specifically about uploaded content.",
+            )
+            tools.append(knowledge_base_tool)
+        except ImportError:
+            # Fallback: create a manual tool using the custom retriever
+            st.info("LangChain's 'create_retriever_tool' not found. Using a basic custom retriever tool.")
+            knowledge_base_tool = Tool(
+                name="KnowledgeBase_Search",
+                func=lambda query: "\n".join([doc.page_content for doc in vector_db.as_retriever(search_kwargs={"k":k_param}).get_relevant_documents(query)]),
+                description="Searches and returns information from the user-provided documents in the knowledge base. Use this for questions specifically about uploaded content."
+            )
+            tools.append(knowledge_base_tool)
 
 
-        knowledge_base_tool = create_retriever_tool(
-            retriever,
-            name="KnowledgeBase_Search",
-            description="Searches and returns information from the user-provided documents in the knowledge base. Use this for questions specifically about uploaded content.",
-        )
-        tools.append(knowledge_base_tool)
+    # --- Direct DuckDuckGo Search Tool (replaces langchain_community.tools.DuckDuckGoSearchResults) ---
+    def duckduckgo_search_tool_func(query: str) -> str:
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=5)]
+            if results:
+                return "\n".join([f"Title: {r['title']}\nURL: {r['href']}\nSnippet: {r['snippet']}" for r in results])
+            return "No search results found."
 
-    web_search = DuckDuckGoSearchResults(max_results=5)
     web_search_tool = Tool(
         name="Web_Search",
         description="Useful for when you need to answer questions about current events, facts, or anything not covered in the provided documents. Prioritize the KnowledgeBase_Search tool if the question is likely about uploaded content.",
-        func=web_search.run,
+        func=duckduckgo_search_tool_func,
     )
     tools.append(web_search_tool)
 
@@ -345,14 +490,41 @@ def get_llm_agent(
         MessagesPlaceholder(variable_name="agent_scratchpad")
     ])
 
-    agent = create_tool_calling_agent(llm, tools, agent_prompt)
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True
-    )
-    return agent_executor
+    # --- Agent Execution Logic ---
+    # This part requires 'langchain' (the main package). If removed, this will fail.
+    # You would need to implement a custom agent loop or switch to a different agent framework.
+    try:
+        from langchain.agents import AgentExecutor, create_tool_calling_agent
+        agent = create_tool_calling_agent(llm, tools, agent_prompt)
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,
+            handle_parsing_errors=True
+        )
+        return agent_executor
+    except ImportError:
+        st.error("LangChain agent components (like AgentExecutor, create_tool_calling_agent) are missing or incompatible.")
+        st.info("Falling back to a basic RAG chain. Dynamic tool use (like Web Search) will be disabled.")
+        # Fallback for simple RAG chain if agent is not available.
+        # This will NOT use tools dynamically but only do RAG if vector_db exists.
+        if vector_db:
+            # Construct a simple RAG chain using Runnable components
+            rag_chain = (
+                {"context": itemgetter("input") | vector_db.as_retriever(search_kwargs={"k":k_param}),
+                 "question": itemgetter("input"),
+                 "chat_history": itemgetter("chat_history")}
+                | ChatPromptTemplate.from_messages([
+                    ("system", "You are a helpful AI assistant. Use the following retrieved context to answer the question. If the context is not sufficient, state that you don't know.\n\nContext: {context}"),
+                    MessagesPlaceholder(variable_name="chat_history"),
+                    ("human", "{question}")
+                ])
+                | llm
+                | StrOutputParser()
+            )
+            return rag_chain
+        else:
+            return None # No RAG or agent available without necessary components
 
 
 def generate_answer_with_memory(
@@ -360,7 +532,7 @@ def generate_answer_with_memory(
     chat_history,
     vector_db
 ):
-    """Generates an answer using the LLM agent, including conversational memory and tool use."""
+    """Generates an answer using the LLM agent/chain, including conversational memory and tool use."""
 
     llm_temperature_param = st.session_state.llm_temperature
     search_type_param = st.session_state.selected_search_type
@@ -368,7 +540,7 @@ def generate_answer_with_memory(
     fetch_k_param = st.session_state.fetch_k_mmr
     lambda_mult_param = st.session_state.lambda_mult_mmr
 
-    agent_executor = get_llm_agent(
+    agent_or_chain = get_llm_agent( # This might return an AgentExecutor or a Runnable chain
         vector_db,
         llm_temperature_param,
         search_type_param,
@@ -377,9 +549,9 @@ def generate_answer_with_memory(
         lambda_mult_param
     )
 
-    if not agent_executor:
-        st.warning("Agent could not be initialized. Please ensure necessary tools are available.")
-        return "An error occurred, agent not initialized.", []
+    if agent_or_chain is None:
+        st.warning("Agent or basic RAG chain could not be initialized. Please ensure necessary components are available.")
+        return "An error occurred, no LLM functionality initialized.", []
 
     processed_query = str(query).strip()
     if not processed_query:
@@ -393,17 +565,33 @@ def generate_answer_with_memory(
             formatted_chat_history.append(AIMessage(content=str(msg["content"])))
 
     try:
-        response = agent_executor.invoke({
-            "input": processed_query,
-            "chat_history": formatted_chat_history
-        })
+        # Check if it's an AgentExecutor or a simple Runnable (chain)
+        if hasattr(agent_or_chain, 'invoke'):
+            response = agent_or_chain.invoke({
+                "input": processed_query,
+                "chat_history": formatted_chat_history
+            })
+        else:
+            # If it's not a standard LangChain agent/chain, it might be a simpler callable.
+            # Given the fallback is a Runnable, this branch should be fine.
+            response = agent_or_chain({"input": processed_query, "chat_history": formatted_chat_history})
 
-        response_text = response.get("output", "No answer generated by agent.")
+
+        # The structure of response depends on whether AgentExecutor or a simple Runnable was returned.
+        response_text = ""
+        if isinstance(response, dict) and "output" in response:
+            response_text = response["output"]
+        elif isinstance(response, str):
+            response_text = response
+        else:
+            response_text = f"Unexpected response format: {type(response)} - {response}"
+
+
         source_docs_for_display = [] # Agent does not directly return source docs in this setup, but you could parse verbose output
         return response_text, source_docs_for_display
 
     except Exception as e:
-        st.error(f"Error generating answer with agent: {e}")
+        st.error(f"Error generating answer with agent/chain: {e}")
         return "An error occurred while trying to generate an answer. Please try again.", []
 
 
@@ -575,16 +763,33 @@ url_col, button_col = st.sidebar.columns([3, 1])
 
 with url_col:
     # Use a dynamic key for the text input to allow easy clearing
-    url_input = st.text_input(
+    url_input_text = st.text_input(
         "Enter URL",
         label_visibility="collapsed",
         placeholder="Enter a URL to load (e.g., https://example.com)...",
         key=f"url_input_{st.session_state.url_input_key}", # Dynamic key based on counter
-        # Removed on_change to simplify state management
     )
 
 with button_col:
-    load_url_button = st.button("Load", key="load_url_button", use_container_width=True)
+    load_url_button_clicked = st.button("Load", key="load_url_button", use_container_width=True)
+
+
+# --- Handle URL Button Click to Set submitted_url in Session State ---
+if load_url_button_clicked:
+    if url_input_text:
+        st.session_state.submitted_url = url_input_text
+        # Increment key to clear the visible input field on rerun
+        st.session_state.url_input_key += 1
+        st.session_state.uploaded_file_key += 1 # Clear file uploader too if new URL is loaded
+        st.session_state.last_uploaded_filename = "" # Reset file status
+        st.session_state.messages = [] # Clear chat on new content load
+        st.rerun() # Force rerun to process submitted_url
+    else:
+        st.warning("Please enter a URL before clicking Load.")
+        st.session_state.submitted_url = "" # Ensure it's empty if button clicked with no URL
+        st.session_state.last_loaded_url = "" # Also clear last loaded on empty submission
+        st.session_state.url_input_key += 1
+        st.rerun() # Force rerun to update UI with warning
 
 
 # --- Initial Load/Check for Existing DB ---
@@ -597,6 +802,9 @@ manage_vector_store(collection_name=st.session_state.current_collection_name)
 if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_filename", ""):
     st.session_state.messages = []
     st.session_state.last_uploaded_filename = uploaded_file.name
+    st.session_state.submitted_url = "" # Clear submitted URL on file upload
+    st.session_state.last_loaded_url = "" # Clear last loaded URL on file upload
+    st.session_state.url_input_key += 1 # Clear URL input field
 
     with st.spinner(f"Processing document '{uploaded_file.name}'..."):
         text_chunks = process_document_to_chunks(uploaded_file, st.session_state.chunk_size, st.session_state.chunk_overlap)
@@ -612,28 +820,30 @@ if uploaded_file and uploaded_file.name != st.session_state.get("last_uploaded_f
         st.rerun()
 
 
-# --- Handle URL Loading (triggered by Load URL button) ---
-if load_url_button and url_input and url_input != st.session_state.get("last_loaded_url", ""):
-    st.session_state.messages = []
-    st.session_state.last_loaded_url = url_input
-
-    text_chunks = process_url_to_chunks(url_input, st.session_state.chunk_size, st.session_state.chunk_overlap)
+# --- Handle URL Processing (triggered by submitted_url in session state) ---
+# This block runs in a subsequent rerun after the button click sets submitted_url
+if st.session_state.submitted_url and st.session_state.submitted_url != st.session_state.last_loaded_url:
+    url_to_process = st.session_state.submitted_url
+    
+    text_chunks = process_url_to_chunks(url_to_process, st.session_state.chunk_size, st.session_state.chunk_overlap)
 
     if text_chunks:
-        manage_vector_store(text_chunks=text_chunks, collection_name=get_url_collection_name(url_input))
-        st.toast(f"Knowledge base ready for '{url_input}'! You can now ask questions.", icon="🎉")
-        st.session_state.url_input_key += 1 # Increment key to clear the input field on rerun
-        st.rerun()
+        manage_vector_store(text_chunks=text_chunks, collection_name=get_url_collection_name(url_to_process))
+        st.toast(f"Knowledge base ready for '{url_to_process}'! You can now ask questions.", icon="🎉")
+        st.session_state.last_loaded_url = url_to_process # Update last loaded successfully
+        st.session_state.submitted_url = "" # Clear submitted_url to prevent re-processing
+        # No st.rerun() here, as manage_vector_store already triggers needed updates implicitly or the change in session state does.
+        # However, if chat history needs clearing, we already do it on button click.
+        # If any other part of the UI needs a hard refresh, a st.rerun() could be added, but let's avoid it unless necessary.
     else:
         st.session_state.vector_db = None
         st.session_state.current_content_source = None
         st.session_state.last_loaded_url = "" # Clear last loaded URL on failure
-        st.session_state.url_input_key += 1 # Increment key to clear the input field on rerun
-        st.rerun()
+        st.session_state.submitted_url = "" # Clear submitted_url on failure
+        st.rerun() # Force a rerun to update UI on failure
 
 
 # --- Display Current Knowledge Base Status ---
-# Removed current_loading_url_status check, as it's not being set consistently
 if st.session_state.vector_db is None:
     st.toast("Please upload a document or load a URL to begin.", icon="⬆️")
     st.write("Current status: No knowledge base loaded.")
@@ -683,6 +893,7 @@ if st.sidebar.button("Clear Chat and Reset RAG Data"):
     st.session_state.uploaded_file_key += 1 # Increment to clear file uploader
     st.session_state.last_uploaded_filename = ""
     st.session_state.last_loaded_url = ""
+    st.session_state.submitted_url = "" # Clear submitted URL on reset
 
     if 'faiss_indexes' in st.session_state:
         st.session_state.faiss_indexes = {}
