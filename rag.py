@@ -20,7 +20,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnablePassthrough, RunnableParallel, RunnableLambda # ADDED RunnableLambda
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import Tool # Re-importing Tool from langchain_core for explicit usage
 
@@ -514,7 +514,8 @@ def get_llm_agent(
             # FIX: Restructure the RAG chain to correctly use the RetrieverWrapper
             # The 'context' key will now get documents from the retriever based on 'input'
             rag_chain_input = RunnableParallel(
-                context=itemgetter("input") | retriever.get_relevant_documents,
+                # CORRECTED LINE BELOW: Using RunnableLambda to make the method call chainable
+                context=itemgetter("input") | RunnableLambda(lambda x: retriever.get_relevant_documents(x)),
                 question=itemgetter("input"),
                 chat_history=itemgetter("chat_history")
             )
