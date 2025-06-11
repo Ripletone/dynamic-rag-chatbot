@@ -509,11 +509,18 @@ def get_llm_agent(
         # Fallback for simple RAG chain if agent is not available.
         # This will NOT use tools dynamically but only do RAG if vector_db exists.
         if vector_db:
-            # Construct a simple RAG chain using Runnable components
+            retriever = vector_db.as_retriever(search_kwargs={"k": k_param})
+
+            # FIX: Restructure the RAG chain to correctly use the RetrieverWrapper
+            # The 'context' key will now get documents from the retriever based on 'input'
+            rag_chain_input = RunnableParallel(
+                context=itemgetter("input") | retriever.get_relevant_documents,
+                question=itemgetter("input"),
+                chat_history=itemgetter("chat_history")
+            )
+
             rag_chain = (
-                {"context": itemgetter("input") | vector_db.as_retriever(search_kwargs={"k":k_param}),
-                 "question": itemgetter("input"),
-                 "chat_history": itemgetter("chat_history")}
+                rag_chain_input
                 | ChatPromptTemplate.from_messages([
                     ("system", "You are a helpful AI assistant. Use the following retrieved context to answer the question. If the context is not sufficient, state that you don't know.\n\nContext: {context}"),
                     MessagesPlaceholder(variable_name="chat_history"),
@@ -574,7 +581,7 @@ def generate_answer_with_memory(
         else:
             # If it's not a standard LangChain agent/chain, it might be a simpler callable.
             # Given the fallback is a Runnable, this branch should be fine.
-            response = agent_or_chain({"input": processed_query, "chat_history": formatted_chat_history})
+            response = agent_or_chain.invoke({"input": processed_query, "chat_history": formatted_chat_history})
 
 
         # The structure of response depends on whether AgentExecutor or a simple Runnable was returned.
