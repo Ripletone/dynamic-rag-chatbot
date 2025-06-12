@@ -12,3 +12,4 @@ duckduckgo-search
 faiss-cpu
 numpy
 nest-asyncio
+sentence-transformers
